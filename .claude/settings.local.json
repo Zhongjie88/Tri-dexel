@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip show PyQt6)",
+      "Bash(python -c \"import PyQt6; print\\(PyQt6.__version__\\)\")"
+    ]
+  }
+}
