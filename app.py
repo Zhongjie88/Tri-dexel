@@ -21,6 +21,7 @@ Dependencies
 import sys
 import math
 import os
+import time
 import numpy as np
 
 os.environ.setdefault("QT_API", "pyqt6")   # tell pyvistaqt to use PyQt6
@@ -43,7 +44,15 @@ from pyvistaqt import QtInteractor
 from src.stock.tri_dexel import TriDexelStock
 from src.tool.tool_geometry import BallEndMill, FlatEndMill
 from src.simulation.engine import SimulationEngine
-from src.gcode.parser import GCodeParser
+from src.simulation.sv_engine import SweptVolumeSimulationEngine
+from src.simulation.collision import collision_summary
+from src.gcode import GCodeParser, SiemensSinumerikParser
+from src.motion.gcode import (
+    gcode_moves_from_canonical_moves,
+    tool_pose_segments_from_gcode_moves,
+    all_pose_segments_from_gcode_moves,
+)
+from src.motion.pose import ToolPose
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -107,6 +116,16 @@ STRATEGIES = {
     "Spiral Contour":    make_spiral,
 }
 
+DEFAULT_STOCK_PATH = (
+    r"C:\Users\a0903\Downloads\數位雙生\4-29-S-CUT\4-29-S-CUT"
+    r"\S_CUT_feedstock_310x210x80_same_origin.stl"
+)
+DEFAULT_GCODE_PATH = (
+    r"C:\Users\a0903\Downloads\數位雙生\4-29-S-CUT\4-29-S-CUT"
+    r"\EM12_ROUGH_B01\EM12_ROUGH_B01.mpf"
+)
+DEFAULT_TOOL_RADIUS = 10.0
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # Worker threads
@@ -119,33 +138,130 @@ class SimWorker(QThread):
     frame_ready = pyqtSignal(object, object)  # (np.ndarray hmap, list tool_pos)
     finished    = pyqtSignal()
 
-    def __init__(self, engine: SimulationEngine, toolpath: list,
-                 emit_every: int = 1, delay_ms: int = 100):
+    def __init__(
+        self,
+        engine: SimulationEngine,
+        toolpath: list,
+        emit_every: int = 1,
+        delay_ms: int = 100,
+        step_multiplier: float = 1.0,
+        frame_interval_ms: int = 0,
+        segment_batch: int = 1,
+        preview_i_idx=None,
+        preview_j_idx=None,
+        live_surface: bool = True,
+    ):
         super().__init__()
         self.engine     = engine
         self.toolpath   = toolpath
         self.emit_every = emit_every
         self.delay_ms   = delay_ms    # writable during run for live speed control
+        self.step_multiplier = step_multiplier
+        self.frame_interval_ms = frame_interval_ms
+        self.segment_batch = segment_batch
+        self.preview_i_idx = preview_i_idx
+        self.preview_j_idx = preview_j_idx
+        self.live_surface = live_surface
         self._stop      = False
 
     def stop(self):
         self._stop = True
 
+    def _preview_height_map(self) -> np.ndarray:
+        full = self.engine.stock.z_grid.height_map()   # O(1) cached copy, shape (nx, ny)
+        if self.preview_i_idx is None or self.preview_j_idx is None:
+            return full
+        rows = np.asarray(self.preview_i_idx, dtype=int)
+        cols = np.asarray(self.preview_j_idx, dtype=int)
+        return full[np.ix_(rows, cols)]                 # vectorised numpy indexing, O(n)
+
     def run(self):
+        if type(self.engine) is SimulationEngine:
+            self._run_legacy_continuous()
+            self.finished.emit()
+            return
+
         total = len(self.toolpath)
-        for idx, (seg_s, seg_e) in enumerate(self.toolpath):
-            if self._stop:
-                break
-            self.engine.simulate_move(seg_s, seg_e)
-            self.progress.emit(idx + 1, total)
+        last_frame_t = 0.0
+        last_progress_t = 0.0
+        idx = 0
+        while idx < total and not self._stop:
+            batch = max(1, int(self.segment_batch))
+            # Geometry accuracy must not depend on animation speed.
+            step = self.engine.stock.resolution
+            last_pos = None
+            for _ in range(batch):
+                if idx >= total or self._stop:
+                    break
+                seg_s, seg_e = self.toolpath[idx]
+                if isinstance(seg_s, ToolPose) and isinstance(seg_e, ToolPose):
+                    is_rapid = seg_e.motion_type == "G0"
+                    if not is_rapid:
+                        self.engine.simulate_pose_move(seg_s, seg_e, step=step)
+                    last_pos = {
+                        "pos": tuple(float(v) for v in seg_e.position),
+                        "axis": tuple(float(v) for v in seg_e.axis),
+                    }
+                    if is_rapid:
+                        # Emit immediately so rapid repositioning is visible;
+                        # do not wait for the batch-end rate-limited emit.
+                        hmap = self._preview_height_map() if self.live_surface else None
+                        self.frame_ready.emit(hmap, last_pos)
+                        last_frame_t = time.perf_counter()
+                        last_pos = None  # consumed; prevent double-emit below
+                else:
+                    self.engine.simulate_move(seg_s, seg_e, step=step)
+                    last_pos = {"pos": seg_e, "axis": (0.0, 0.0, 1.0)}
+                idx += 1
+
+            now = time.perf_counter()
+            if now - last_progress_t >= 0.05 or idx == total - 1:
+                self.progress.emit(idx, total)
+                last_progress_t = now
+
             emit_every = max(1, int(self.emit_every))
-            if idx % emit_every == 0 or idx == total - 1:
-                hmap = self.engine.stock.z_grid.height_map().copy()
-                self.frame_ready.emit(hmap, list(seg_e))
+            interval_s = max(0, int(self.frame_interval_ms)) / 1000.0
+            frame_due = interval_s <= 0.0 or now - last_frame_t >= interval_s
+            if ((idx % emit_every == 0 and frame_due) or idx >= total) and last_pos is not None:
+                hmap = self._preview_height_map() if self.live_surface else None
+                self.frame_ready.emit(hmap, last_pos)
+                last_frame_t = now
             d = self.delay_ms
             if d > 0:
                 self.msleep(d)
         self.finished.emit()
+
+    def _run_legacy_continuous(self):
+        total = len(self.toolpath)
+        last_frame_t = 0.0
+        last_progress_t = 0.0
+        # Geometry accuracy must not depend on animation speed.
+        step = self.engine.stock.resolution
+        interval_s = max(0, int(self.frame_interval_ms)) / 1000.0
+
+        def _progress(cur: int, n_total: int, pos):
+            nonlocal last_frame_t, last_progress_t
+            if self._stop:
+                return
+            now = time.perf_counter()
+            if now - last_progress_t >= 0.05 or cur >= n_total:
+                self.progress.emit(cur, n_total)
+                last_progress_t = now
+            frame_due = interval_s <= 0.0 or now - last_frame_t >= interval_s
+            if frame_due or cur >= n_total:
+                hmap = self._preview_height_map() if self.live_surface else None
+                self.frame_ready.emit(hmap, {"pos": list(pos), "axis": [0.0, 0.0, 1.0]})
+                last_frame_t = now
+            d = self.delay_ms
+            if d > 0:
+                self.msleep(d)
+
+        self.engine.simulate_toolpath(
+            self.toolpath,
+            step=step,
+            progress_callback=_progress,
+            stop_callback=lambda: self._stop,
+        )
 
 
 class MeshWorker(QThread):
@@ -178,13 +294,15 @@ class MainWindow(QMainWindow):
 
         # simulation state
         self._stock: TriDexelStock | None       = None
-        self._engine: SimulationEngine | None   = None
+        self._engine: SimulationEngine | SweptVolumeSimulationEngine | None = None
         self._worker: SimWorker | None          = None
         self._mesh_worker: MeshWorker | None    = None
         self._surface: pv.StructuredGrid | None = None
         self._surface_actor                     = None
         self._tool_actor                        = None
+        self._result_mesh: pv.PolyData | None   = None
         self._gcode_actors: list                = []
+        self._coverage_actors: list             = []
         self._xx = self._yy                     = None
         self._display_i_idx = self._display_j_idx = None
         self._display_i_edges = self._display_j_edges = None
@@ -193,11 +311,13 @@ class MainWindow(QMainWindow):
         self._stock_file: str | None = None
         self._gcode_file: str | None = None
         self._gcode_moves: list | None = None   # parsed on file browse; used for overlay
+        self._canonical_program = None
         self._last_scene_bounds: tuple | None = None
 
         # render throttle — simulation thread writes here; QTimer reads at 30 fps
         self._pending_hmap: np.ndarray | None = None
         self._pending_tool_pos: list | None    = None
+        self._pending_frame_dirty = False
         self._render_timer = QTimer(self)
         self._render_timer.setInterval(33)          # ≈ 30 fps
         self._render_timer.timeout.connect(self._render_pending_frame)
@@ -205,6 +325,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_stylesheet()
         self._idle_scene()
+        QTimer.singleShot(0, self._load_default_inputs)
 
     # ── UI construction ────────────────────────────────────────────────
 
@@ -375,6 +496,11 @@ class MainWindow(QMainWindow):
         self.chk_gcode_overlay.setChecked(True)
         self.chk_gcode_overlay.toggled.connect(self._on_gcode_overlay_toggled)
         gf.addWidget(self.chk_gcode_overlay)
+        self.chk_coverage_overlay = QCheckBox("Show coverage gaps")
+        self.chk_coverage_overlay.setObjectName("switch")
+        self.chk_coverage_overlay.setChecked(False)
+        self.chk_coverage_overlay.toggled.connect(self._on_coverage_overlay_toggled)
+        gf.addWidget(self.chk_coverage_overlay)
         cv.addWidget(self.w_gcode)
 
         self.rb_gcode.toggled.connect(lambda on: (
@@ -392,11 +518,12 @@ class MainWindow(QMainWindow):
         tg.addWidget(QLabel("Type"), 0, 0)
         self.cb_tool = QComboBox()
         self.cb_tool.addItems(["Ball-end Mill", "Flat-end Mill"])
+        self.cb_tool.setCurrentIndex(1)
         tg.addWidget(self.cb_tool, 0, 1)
         tg.addWidget(QLabel("Radius"), 1, 0)
         self.sp_radius = QDoubleSpinBox()
         self.sp_radius.setRange(0.5, 50.0)
-        self.sp_radius.setValue(5.0)
+        self.sp_radius.setValue(DEFAULT_TOOL_RADIUS)
         self.sp_radius.setSingleStep(0.5)
         self.sp_radius.setSuffix(" mm")
         tg.addWidget(self.sp_radius, 1, 1)
@@ -416,7 +543,27 @@ class MainWindow(QMainWindow):
         self.sp_res.setSingleStep(0.25)
         self.sp_res.setSuffix(" mm")
         sg.addWidget(self.sp_res, 0, 1)
+        sg.addWidget(QLabel("Method"), 1, 0)
+        self.cb_sim_method = QComboBox()
+        self.cb_sim_method.addItems(["Legacy Sampling", "Swept Volume"])
+        sg.addWidget(self.cb_sim_method, 1, 1)
         cv.addLayout(sg)
+
+        self.chk_collision = QCheckBox("Check shank / holder collision")
+        self.chk_collision.setObjectName("switch")
+        self.chk_collision.setChecked(False)
+        self.chk_collision.setEnabled(False)
+        cv.addWidget(self.chk_collision)
+        self.cb_sim_method.currentIndexChanged.connect(self._on_sim_method_changed)
+        self.chk_collision.toggled.connect(lambda _checked: self._update_collision_status())
+
+        self.chk_final_only = QCheckBox("Fast final-only preview")
+        self.chk_final_only.setObjectName("switch")
+        self.chk_final_only.setChecked(False)
+        self.chk_final_only.toggled.connect(
+            lambda _checked: self._on_speed_changed(self.sl_speed.value())
+        )
+        cv.addWidget(self.chk_final_only)
 
         # Speed slider
         cv.addWidget(QLabel("Simulation Speed"))
@@ -438,8 +585,12 @@ class MainWindow(QMainWindow):
         sr.addWidget(lbl_f)
         cv.addWidget(sp_row)
 
-        delay_ms = self._speed_delay_ms(self.sl_speed.value())
-        self.lbl_speed_val = QLabel(f"{delay_ms} ms delay")
+        delay_ms, step_multiplier, frame_interval_ms, segment_batch = self._speed_settings(
+            self.sl_speed.value()
+        )
+        self.lbl_speed_val = QLabel(
+            self._speed_label(delay_ms, step_multiplier, frame_interval_ms, segment_batch)
+        )
         self.lbl_speed_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_speed_val.setObjectName("muted")
         cv.addWidget(self.lbl_speed_val)
@@ -477,6 +628,15 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_reset)
         cv.addLayout(btn_row)
 
+        self.btn_export = QPushButton("Export Result")
+        self.btn_export.setObjectName("browse_btn")
+        self.btn_export.setFixedHeight(42)
+        self.btn_export.setAutoDefault(False)
+        self.btn_export.setDefault(False)
+        self.btn_export.setEnabled(False)
+        self.btn_export.clicked.connect(self._export_result_mesh)
+        cv.addWidget(self.btn_export)
+
         # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -491,6 +651,13 @@ class MainWindow(QMainWindow):
         self.lbl_seg.setFixedHeight(24)
         self.lbl_seg.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         cv.addWidget(self.lbl_seg)
+
+        self.lbl_collision = QLabel("Collision check: Swept only")
+        self.lbl_collision.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_collision.setObjectName("collision_status")
+        self.lbl_collision.setFixedHeight(30)
+        self.lbl_collision.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        cv.addWidget(self.lbl_collision)
 
         # Status
         cv.addWidget(self._divider())
@@ -631,6 +798,16 @@ class MainWindow(QMainWindow):
                 border: 1px solid {T3};
                 border-radius: 3px;
                 padding: 10px 12px;
+            }}
+
+            QLabel#collision_status {{
+                color: {T2};
+                font-size: 13px;
+                font-weight: bold;
+                background: {FIELD};
+                border: 1px solid {T3};
+                border-radius: 3px;
+                padding: 6px 8px;
             }}
 
             QFrame#divider {{ background: {T3}; }}
@@ -790,12 +967,11 @@ class MainWindow(QMainWindow):
         """
         rapid_pts: list = []
         feed_pts:  list = []
-        pos = [0.0, 0.0, 0.0]
         for m in moves:
+            start = [m.start_x, m.start_y, m.start_z]
             cur = [m.x, m.y, m.z]
             target = rapid_pts if m.rapid else feed_pts
-            target.extend([pos[:], cur[:]])
-            pos = cur
+            target.extend([start, cur])
 
         def _build(pts_list):
             if not pts_list:
@@ -864,10 +1040,128 @@ class MainWindow(QMainWindow):
                 actor.SetVisibility(visible)
         self.plotter.render()
 
+    def _clear_coverage_overlay(self):
+        for actor in self._coverage_actors:
+            if actor is not None:
+                try:
+                    self.plotter.remove_actor(actor)
+                except Exception:
+                    pass
+        self._coverage_actors = []
+
+    def _coverage_gap_mesh(self, bounds: tuple[float, ...]) -> pv.PolyData | None:
+        if not self._gcode_moves:
+            return None
+        x_min, x_max, y_min, y_max, _, z_max = bounds
+        radius = float(self.sp_radius.value())
+        cell = max(float(self.sp_res.value()), 2.0)
+        xs = np.arange(x_min, x_max + 1e-9, cell)
+        ys = np.arange(y_min, y_max + 1e-9, cell)
+        if len(xs) < 2 or len(ys) < 2:
+            return None
+
+        covered = np.zeros((len(xs), len(ys)), dtype=bool)
+        feed_moves = [m for m in self._gcode_moves if not m.rapid]
+        sample_step = max(cell, radius * 0.5)
+        r2 = radius * radius
+        for m in feed_moves:
+            sx, sy, sz = m.start_x, m.start_y, m.start_z
+            ex, ey, ez = m.x, m.y, m.z
+            length = math.dist((sx, sy, sz), (ex, ey, ez))
+            n = max(1, math.ceil(length / sample_step))
+            for k in range(n + 1):
+                t = k / n
+                x = sx + (ex - sx) * t
+                y = sy + (ey - sy) * t
+                i0 = max(0, int(math.floor((x - radius - x_min) / cell)))
+                i1 = min(len(xs) - 1, int(math.ceil((x + radius - x_min) / cell)))
+                j0 = max(0, int(math.floor((y - radius - y_min) / cell)))
+                j1 = min(len(ys) - 1, int(math.ceil((y + radius - y_min) / cell)))
+                if i0 > i1 or j0 > j1:
+                    continue
+                xx = xs[i0 : i1 + 1, np.newaxis]
+                yy = ys[np.newaxis, j0 : j1 + 1]
+                covered[i0 : i1 + 1, j0 : j1 + 1] |= (xx - x) ** 2 + (yy - y) ** 2 <= r2
+
+        gap = ~covered
+        if not np.any(gap):
+            return None
+
+        z = z_max + max(0.05, self.sp_res.value() * 0.1)
+        points: list[tuple[float, float, float]] = []
+        faces: list[int] = []
+        half = cell * 0.5
+        for i, j in np.argwhere(gap):
+            x = float(xs[i])
+            y = float(ys[j])
+            base = len(points)
+            points.extend(
+                [
+                    (x - half, y - half, z),
+                    (x + half, y - half, z),
+                    (x + half, y + half, z),
+                    (x - half, y + half, z),
+                ]
+            )
+            faces.extend([4, base, base + 1, base + 2, base + 3])
+        mesh = pv.PolyData(np.asarray(points), np.asarray(faces, dtype=np.int64))
+        mesh["coverage_gap"] = np.ones(mesh.n_points)
+        return mesh
+
+    def _add_coverage_overlay(self):
+        self._clear_coverage_overlay()
+        if not hasattr(self, "chk_coverage_overlay") or not self.chk_coverage_overlay.isChecked():
+            return
+        if self._last_scene_bounds is not None:
+            bounds = self._last_scene_bounds
+        elif self.rb_file.isChecked() and self._stock_file:
+            from src.stock.stl_importer import load_mesh
+
+            bounds = tuple(float(v) for v in load_mesh(self._stock_file).bounds)
+        else:
+            bounds = (
+                0.0,
+                self.sp_bx.value(),
+                0.0,
+                self.sp_by.value(),
+                0.0,
+                self.sp_bz.value(),
+            )
+        mesh = self._coverage_gap_mesh(bounds)
+        if mesh is None:
+            actor = self.plotter.add_text(
+                "Coverage gaps: none",
+                position=(0.01, 0.14),
+                font_size=9,
+                color=SUCCESS,
+                shadow=True,
+                viewport=True,
+            )
+            self._coverage_actors.append(actor)
+            return
+        actor = self.plotter.add_mesh(
+            mesh,
+            color=DANGER,
+            opacity=0.38,
+            lighting=False,
+            show_edges=False,
+        )
+        self._coverage_actors.append(actor)
+        actor = self.plotter.add_text(
+            "Red = no cutter footprint coverage",
+            position=(0.01, 0.14),
+            font_size=9,
+            color=DANGER,
+            shadow=True,
+            viewport=True,
+        )
+        self._coverage_actors.append(actor)
+
     def _idle_scene(self):
         """Default view: solid box representing the configured stock."""
         self.plotter.clear()
         self._gcode_actors = []
+        self._coverage_actors = []
         self.plotter.set_background(BG, top="#12192e")
 
         if self.rb_file.isChecked() and self._stock_file:
@@ -877,6 +1171,7 @@ class MainWindow(QMainWindow):
         d = self.sp_by.value()
         h = self.sp_bz.value()
         bounds = (0.0, w, 0.0, d, 0.0, h)
+        self._last_scene_bounds = bounds
         x_min, x_max, y_min, y_max, z_min, z_max = bounds
 
         box = pv.Box(bounds=bounds)
@@ -893,6 +1188,7 @@ class MainWindow(QMainWindow):
             position="lower_edge", font_size=10, color=T3,
         )
         self._add_gcode_overlay()
+        self._add_coverage_overlay()
         self.plotter.show_axes()
         self._set_default_camera(x_min, x_max, y_min, y_max, z_min, z_max)
         self.plotter.render()
@@ -905,6 +1201,7 @@ class MainWindow(QMainWindow):
             mesh = load_mesh(path)
             self.plotter.clear()
             self._gcode_actors = []
+            self._coverage_actors = []
             self.plotter.set_background(BG, top="#12192e")
             show_gcode = self._gcode_moves and self.chk_gcode_overlay.isChecked()
             stock_opacity = 0.38 if show_gcode else 1.0
@@ -915,6 +1212,14 @@ class MainWindow(QMainWindow):
             b = mesh.bounds
             x_min, x_max, y_min, y_max, z_min, z_max = (
                 b[0], b[1], b[2], b[3], b[4], b[5])
+            self._last_scene_bounds = (
+                float(x_min),
+                float(x_max),
+                float(y_min),
+                float(y_max),
+                float(z_min),
+                float(z_max),
+            )
             box = pv.Box(bounds=(x_min, x_max, y_min, y_max, z_min, z_max))
             self.plotter.add_mesh(box, style="wireframe", color=BOX_C,
                                    opacity=0.2, line_width=1.0)
@@ -924,6 +1229,7 @@ class MainWindow(QMainWindow):
                 position="lower_edge", font_size=9, color=T2,
             )
             self._add_gcode_overlay()
+            self._add_coverage_overlay()
             self.plotter.show_axes()
             self._set_default_camera(x_min, x_max, y_min, y_max, z_min, z_max)
             self.plotter.render()
@@ -964,13 +1270,14 @@ class MainWindow(QMainWindow):
         """(Re)build the 3-D scene for a new simulation run."""
         self.plotter.clear()
         self._gcode_actors = []
+        self._coverage_actors = []
         self.plotter.set_background(BG, top="#12192e")
         self._last_scene_bounds = bounds
 
         x_min, x_max, y_min, y_max, z_min, z_max = bounds
         s = self._stock
 
-        max_live_axis = 180
+        max_live_axis = self._live_preview_axis()
         n_disp_i = min(s.nx, max_live_axis)
         n_disp_j = min(s.ny, max_live_axis)
         self._display_i_edges = np.linspace(0, s.nx, n_disp_i + 1, dtype=int)
@@ -1053,11 +1360,10 @@ class MainWindow(QMainWindow):
         self.plotter.add_mesh(box, style="wireframe", color=BOX_C,
                                line_width=1.4, opacity=0.42)
 
-        # Tool sphere
-        r = self._engine.tool.radius
-        sphere = pv.Sphere(radius=r, theta_resolution=28, phi_resolution=28)
+        # Tool visual mesh: cutter tip at local origin, shank extends along +Z.
+        tool_mesh = self._build_tool_visual_mesh()
         self._tool_actor = self.plotter.add_mesh(
-            sphere, color=TOOL_C, opacity=0.95,
+            tool_mesh, color=TOOL_C, opacity=0.95,
             smooth_shading=True, specular=0.75,
         )
         self._tool_actor.position = [
@@ -1067,6 +1373,7 @@ class MainWindow(QMainWindow):
         ]
 
         self._add_gcode_overlay()
+        self._add_coverage_overlay()
         self.plotter.show_axes()
         self._set_default_camera(x_min, x_max, y_min, y_max, z_min, z_max)
         self.plotter.render()
@@ -1074,7 +1381,15 @@ class MainWindow(QMainWindow):
     # ── Frame / progress slots ─────────────────────────────────────────
 
     def _apply_hmap_to_surface(self, hmap: np.ndarray) -> None:
-        if self._display_i_edges is not None and self._display_j_edges is not None:
+        expected_shape = (
+            len(self._display_i_idx) if self._display_i_idx is not None else 0,
+            len(self._display_j_idx) if self._display_j_idx is not None else 0,
+        )
+        if (
+            hmap.shape != expected_shape
+            and self._display_i_edges is not None
+            and self._display_j_edges is not None
+        ):
             hmap = self._pool_hmap_for_display(hmap)
         zz  = np.nan_to_num(hmap, nan=self._stock.z_min)
         # Update only the Z column of the existing point array.
@@ -1111,30 +1426,132 @@ class MainWindow(QMainWindow):
                 pooled[oi, oj] = np.nanmin(block)
         return pooled
 
+    def _surface_of_revolution_mesh(self, rings: list[list[tuple[float, float, float]]]) -> pv.PolyData:
+        """Build a wrapped quad mesh from rings sampled around local +Z."""
+        if len(rings) < 2 or len(rings[0]) < 3:
+            raise ValueError("tool mesh requires at least two rings and three sectors")
+        n_v = len(rings)
+        n_u = len(rings[0])
+        points = np.asarray([pt for ring in rings for pt in ring], dtype=float)
+        faces: list[int] = []
+        for j in range(n_v - 1):
+            for i in range(n_u):
+                a = j * n_u + i
+                b = j * n_u + ((i + 1) % n_u)
+                c = (j + 1) * n_u + ((i + 1) % n_u)
+                d = (j + 1) * n_u + i
+                faces.extend([4, a, b, c, d])
+        return pv.PolyData(points, np.asarray(faces, dtype=np.int64)).clean()
+
+    def _disk_mesh(self, radius: float, z: float, sectors: int, normal_down: bool) -> pv.PolyData:
+        points = [(0.0, 0.0, z)]
+        for i in range(sectors):
+            a = 2.0 * math.pi * i / sectors
+            points.append((radius * math.cos(a), radius * math.sin(a), z))
+        faces: list[int] = []
+        for i in range(sectors):
+            a = i + 1
+            b = ((i + 1) % sectors) + 1
+            if normal_down:
+                faces.extend([3, 0, b, a])
+            else:
+                faces.extend([3, 0, a, b])
+        return pv.PolyData(np.asarray(points, dtype=float), np.asarray(faces, dtype=np.int64))
+
+    def _build_tool_visual_mesh(self) -> pv.PolyData:
+        """Create a cutter-shaped visual mesh in local coordinates with tip at origin."""
+        tool = self._engine.tool
+        r = float(tool.radius)
+        sectors = 48
+        height = max(4.0 * r, r + 8.0)
+
+        if isinstance(tool, BallEndMill):
+            rings = []
+            for j in range(18):
+                theta = 0.5 * math.pi * j / 17
+                rr = r * math.sin(theta)
+                z = r - r * math.cos(theta)
+                ring = []
+                for i in range(sectors):
+                    a = 2.0 * math.pi * i / sectors
+                    ring.append((rr * math.cos(a), rr * math.sin(a), z))
+                rings.append(ring)
+            for z in np.linspace(r, r + height, 18)[1:]:
+                ring = []
+                for i in range(sectors):
+                    a = 2.0 * math.pi * i / sectors
+                    ring.append((r * math.cos(a), r * math.sin(a), float(z)))
+                rings.append(ring)
+            mesh = self._surface_of_revolution_mesh(rings)
+            top = self._disk_mesh(r, r + height, sectors, normal_down=False)
+            return mesh.merge(top).clean()
+
+        rings = []
+        for z in np.linspace(0.0, height, 24):
+            ring = []
+            for i in range(sectors):
+                a = 2.0 * math.pi * i / sectors
+                ring.append((r * math.cos(a), r * math.sin(a), float(z)))
+            rings.append(ring)
+        side = self._surface_of_revolution_mesh(rings)
+        bottom = self._disk_mesh(r, 0.0, sectors, normal_down=True)
+        top = self._disk_mesh(r, height, sectors, normal_down=False)
+        return side.merge(bottom).merge(top).clean()
+
     @pyqtSlot(object, object)
     def _on_frame(self, hmap, tool_pos):
         # Just cache the latest data; the QTimer fires the actual render at 30 fps.
         # This prevents signal-queue pile-up when simulation runs faster than the GPU.
         self._pending_hmap     = hmap
         self._pending_tool_pos = tool_pos
+        self._pending_frame_dirty = True
 
     def _render_pending_frame(self):
         """Called by self._render_timer every 33 ms — one render per tick at most."""
         hmap = self._pending_hmap
-        if hmap is None or self._surface is None or self._xx is None:
+        pos = self._pending_tool_pos
+        if not self._pending_frame_dirty:
+            return
+        if self._surface is None or self._xx is None:
+            self._pending_frame_dirty = False
             return
         self._pending_hmap = None           # consume
-        pos = self._pending_tool_pos
-        try:
-            self._apply_hmap_to_surface(hmap)
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            self._set_status(f"Render error: {exc}", DANGER)
-            return
+        self._pending_frame_dirty = False
+        if hmap is not None:
+            try:
+                self._apply_hmap_to_surface(hmap)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"Render error: {exc}", DANGER)
+                return
         if self._tool_actor is not None and pos is not None:
-            self._tool_actor.position = pos
+            if isinstance(pos, dict):
+                self._apply_tool_pose_to_actor(
+                    self._tool_actor, pos["pos"], pos.get("axis", [0.0, 0.0, 1.0])
+                )
+            else:
+                self._tool_actor.position = pos
         self.plotter.render()
+
+    def _apply_tool_pose_to_actor(self, actor, pos, axis) -> None:
+        """Move and orient the tool actor: tip at pos, spindle pointing along axis."""
+        z = np.asarray(axis, dtype=float)
+        n = float(np.linalg.norm(z))
+        z = z / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+        # Build an orthonormal frame with z as the tool axis.
+        ref = np.array([1.0, 0.0, 0.0]) if abs(z[2]) > 0.95 else np.array([0.0, 0.0, 1.0])
+        x = np.cross(ref, z)
+        x = x / np.linalg.norm(x)
+        y = np.cross(z, x)
+        R = np.eye(4, dtype=float)
+        R[:3, 0] = x
+        R[:3, 1] = y
+        R[:3, 2] = z
+        # user_matrix rotates mesh around its local origin (tip), then
+        # actor.position translates in world space.
+        actor.user_matrix = R
+        actor.position = list(pos)
 
     @pyqtSlot(int, int)
     def _on_progress(self, cur: int, total: int):
@@ -1146,6 +1563,7 @@ class MainWindow(QMainWindow):
     def _on_finished(self):
         self._render_timer.stop()
         self._pending_hmap = None
+        self._pending_frame_dirty = False
 
         if self._stock is not None and self._surface is not None:
             self._apply_hmap_to_surface(self._stock.z_grid.height_map())
@@ -1162,6 +1580,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(object)
     def _on_mesh_ready(self, mesh: "pv.PolyData"):
+        self._result_mesh = mesh.copy(deep=True)
         if self._surface_actor is not None:
             self.plotter.remove_actor(self._surface_actor)
             self._surface_actor = None
@@ -1218,24 +1637,195 @@ class MainWindow(QMainWindow):
             line_width=1.0, opacity=0.24,
         )
         self._add_gcode_overlay()
+        self._add_coverage_overlay()
         self.plotter.render()
 
         self.lbl_seg.setText("Idle")
         self.btn_start.setEnabled(True)
-        self._set_status("Complete", SUCCESS)
+        self.btn_export.setEnabled(True)
+        self._update_collision_status()
+        collision_count = len(getattr(self._engine, "collision_events", []))
+        if collision_count:
+            self._set_status(f"Complete with {collision_count} collision samples", DANGER)
+        else:
+            self._set_status("Complete", SUCCESS)
 
     # ── Speed ──────────────────────────────────────────────────────────
+
+    def _export_result_mesh(self):
+        if self._result_mesh is None:
+            self._set_status("No finished result to export", WARNING)
+            return
+
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Machined Stock",
+            "",
+            "STL + STEP (*.stl *.step);;STL Mesh (*.stl);;STEP Faceted CAD (*.step *.stp)",
+        )
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        if not ext:
+            if "STL + STEP" in selected_filter:
+                path += ".stl"
+                ext = ".stl"
+            elif "STEP" in selected_filter:
+                path += ".step"
+                ext = ".step"
+            else:
+                path += ".stl"
+                ext = ".stl"
+
+        try:
+            mesh = self._result_mesh.triangulate().clean()
+            if "STL + STEP" in selected_filter:
+                base, chosen_ext = os.path.splitext(path)
+                if chosen_ext.lower() in (".stl", ".step", ".stp"):
+                    stl_path = base + ".stl"
+                    step_path = base + ".step"
+                else:
+                    stl_path = path + ".stl"
+                    step_path = path + ".step"
+                mesh.save(stl_path, binary=True)
+                self._save_faceted_step(mesh, step_path)
+                path = f"{stl_path}, {step_path}"
+            elif ext == ".stl":
+                mesh.save(path, binary=True)
+            elif ext in (".step", ".stp"):
+                self._save_faceted_step(mesh, path)
+            else:
+                raise ValueError("Please choose .stl, .step, or .stp")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", str(exc))
+            self._set_status("Export failed", DANGER)
+            return
+
+        self._set_status(f"Exported: {os.path.basename(path)}", SUCCESS)
+
+    # STEP defaults to a compact machined top-surface B-Spline. The full
+    # faceted solid is too large for practical SolidWorks assembly workflows.
+    _STEP_SURFACE_MAX_GRID = 80
+
+    def _save_faceted_step(self, mesh: "pv.PolyData", path: str) -> None:
+        """Export the machined top surface as a compact OpenCascade STEP file."""
+        from src.reconstruction.occ_step_export import export_zmap_surface_as_occ_step
+
+        resolution = getattr(self._stock, "resolution", 1.0)
+        result = export_zmap_surface_as_occ_step(
+            self._stock,
+            path,
+            max_grid=self._STEP_SURFACE_MAX_GRID,
+            tolerance=max(float(resolution) * 0.2, 0.05),
+        )
+        self._set_status(
+            "STEP surface fitted "
+            f"{result.source_shape[0]}x{result.source_shape[1]} -> "
+            f"{result.output_shape[0]}x{result.output_shape[1]} control samples",
+            WARNING,
+        )
 
     @staticmethod
     def _speed_delay_ms(val: int) -> int:
         return max(0, (10 - val) * 15)
 
+    def _live_preview_axis(self) -> int:
+        val = self.sl_speed.value() if hasattr(self, "sl_speed") else 4
+        if val >= 10:
+            return 60
+        if val >= 9:
+            return 72
+        if val >= 8:
+            return 90
+        if val >= 6:
+            return 120
+        return 180
+
+    @classmethod
+    def _speed_settings(cls, val: int) -> tuple[int, float, int, int]:
+        delay_ms = cls._speed_delay_ms(val)
+        if val >= 10:
+            return delay_ms, 4.0, 80, 120
+        if val >= 9:
+            return delay_ms, 3.0, 60, 60
+        if val >= 8:
+            return delay_ms, 2.0, 45, 25
+        if val >= 6:
+            return delay_ms, 1.5, 33, 8
+        return delay_ms, 1.0, 0, 1
+
+    def _speed_label(
+        self,
+        delay_ms: int,
+        step_multiplier: float,
+        frame_interval_ms: int,
+        segment_batch: int,
+    ) -> str:
+        if step_multiplier <= 1.0 and frame_interval_ms <= 0 and segment_batch <= 1:
+            base = f"{delay_ms} ms delay"
+        else:
+            base = (
+            f"{delay_ms} ms delay, "
+            f"batch {segment_batch}, live {self._live_preview_axis()}px"
+            )
+        if hasattr(self, "chk_final_only") and self.chk_final_only.isChecked():
+            return f"{base}, final only"
+        return base
+
     @pyqtSlot(int)
     def _on_speed_changed(self, val: int):
-        delay_ms = self._speed_delay_ms(val)
-        self.lbl_speed_val.setText(f"{delay_ms} ms delay")
+        delay_ms, step_multiplier, frame_interval_ms, segment_batch = self._speed_settings(val)
+        self.lbl_speed_val.setText(
+            self._speed_label(delay_ms, step_multiplier, frame_interval_ms, segment_batch)
+        )
         if self._worker is not None and self._worker.isRunning():
             self._worker.delay_ms = delay_ms
+            self._worker.step_multiplier = step_multiplier
+            self._worker.frame_interval_ms = frame_interval_ms
+            self._worker.segment_batch = segment_batch
+
+    def _on_sim_method_changed(self, index: int):
+        is_swept = index == 1
+        self.chk_collision.setEnabled(is_swept)
+        if not is_swept:
+            self.chk_collision.setChecked(False)
+        self._update_collision_status()
+
+    def _update_collision_status(self):
+        if not hasattr(self, "lbl_collision"):
+            return
+        events = getattr(self._engine, "collision_events", None)
+        if events:
+            summary = collision_summary(events)
+            detail = ", ".join(
+                f"{name} {count}" for name, count in sorted(summary.items())
+            )
+            self.lbl_collision.setText(f"Collision warning: {detail}")
+            self.lbl_collision.setStyleSheet(
+                f"color:{DANGER};font-size:13px;font-weight:bold;"
+                f"background:{FIELD};border:1px solid {DANGER};"
+                f"border-radius:3px;padding:6px 8px;"
+            )
+            return
+        if self.chk_collision.isChecked() and self.chk_collision.isEnabled():
+            text = "Collision check: No contact"
+            color = SUCCESS
+            border = SUCCESS
+        elif self.chk_collision.isEnabled():
+            text = "Collision check: Off"
+            color = T2
+            border = T3
+        else:
+            text = "Collision check: Swept only"
+            color = T2
+            border = T3
+        self.lbl_collision.setText(text)
+        self.lbl_collision.setStyleSheet(
+            f"color:{color};font-size:13px;font-weight:bold;"
+            f"background:{FIELD};border:1px solid {border};"
+            f"border-radius:3px;padding:6px 8px;"
+        )
 
     @pyqtSlot(bool)
     def _on_gcode_overlay_toggled(self, checked: bool):
@@ -1249,7 +1839,67 @@ class MainWindow(QMainWindow):
         else:
             self._idle_scene()
 
+    @pyqtSlot(bool)
+    def _on_coverage_overlay_toggled(self, checked: bool):
+        if checked:
+            self._add_coverage_overlay()
+        else:
+            self._clear_coverage_overlay()
+        self.plotter.render()
+
     # ── File browse ────────────────────────────────────────────────────
+
+    def _style_selected_file_label(self, label: QLabel, path: str) -> None:
+        label.setText(os.path.basename(path))
+        label.setStyleSheet(
+            f"color:{T1};font-size:12px;background:{FIELD};"
+            f"border:1px solid {ACCENT};border-radius:3px;padding:7px 9px;"
+        )
+
+    def _load_default_inputs(self) -> None:
+        self.sp_radius.setValue(DEFAULT_TOOL_RADIUS)
+        loaded_parts = []
+
+        if os.path.exists(DEFAULT_STOCK_PATH):
+            self.rb_file.setChecked(True)
+            self._stock_file = DEFAULT_STOCK_PATH
+            self._style_selected_file_label(self.lbl_stock_path, DEFAULT_STOCK_PATH)
+            loaded_parts.append("stock")
+
+        if os.path.exists(DEFAULT_GCODE_PATH):
+            self.rb_gcode.setChecked(True)
+            self._gcode_file = DEFAULT_GCODE_PATH
+            self._style_selected_file_label(self.lbl_gcode_path, DEFAULT_GCODE_PATH)
+            try:
+                self._canonical_program = self._load_canonical_gcode(DEFAULT_GCODE_PATH)
+                self._gcode_moves = gcode_moves_from_canonical_moves(
+                    self._canonical_program.moves
+                )
+                loaded_parts.append("G-code")
+            except Exception as exc:
+                self._gcode_moves = None
+                self._canonical_program = None
+                self._set_status(f"Default G-code parse error: {exc}", DANGER)
+                return
+
+        if self._stock_file:
+            self._preview_stl(self._stock_file)
+        elif self._gcode_moves:
+            self._idle_scene()
+
+        missing = []
+        if not os.path.exists(DEFAULT_STOCK_PATH):
+            missing.append("stock")
+        if not os.path.exists(DEFAULT_GCODE_PATH):
+            missing.append("G-code")
+        if missing:
+            self._set_status(f"Default missing: {', '.join(missing)}", WARNING)
+        elif loaded_parts:
+            n_f = sum(1 for m in self._gcode_moves or [] if not m.rapid)
+            self._set_status(
+                f"Default loaded: {', '.join(loaded_parts)}, radius {DEFAULT_TOOL_RADIUS:g} mm, {n_f} feed",
+                SUCCESS,
+            )
 
     @pyqtSlot()
     def _browse_stock_file(self):
@@ -1284,7 +1934,10 @@ class MainWindow(QMainWindow):
             f"border:1px solid {ACCENT};border-radius:3px;padding:7px 9px;"
         )
         try:
-            self._gcode_moves = GCodeParser().parse_file(path)
+            self._canonical_program = self._load_canonical_gcode(path)
+            self._gcode_moves = gcode_moves_from_canonical_moves(
+                self._canonical_program.moves
+            )
             n_f = sum(1 for m in self._gcode_moves if not m.rapid)
             n_r = len(self._gcode_moves) - n_f
             # Rebuild the idle/preview scene so the toolpath overlay appears immediately
@@ -1292,12 +1945,103 @@ class MainWindow(QMainWindow):
                 self._preview_stl(self._stock_file)
             else:
                 self._idle_scene()
-            self._set_status(f"G-code: {n_f} feed, {n_r} rapid", SUCCESS)
+            warn_count = len(self._canonical_program.warnings)
+            controller = self._canonical_program.controller
+            suffix = f", {warn_count} warnings" if warn_count else ""
+            self._set_status(f"G-code [{controller}]: {n_f} feed, {n_r} rapid{suffix}", SUCCESS)
         except Exception as exc:
             self._gcode_moves = None
+            self._canonical_program = None
             self._set_status(f"Parse error: {exc}", DANGER)
 
     # ── Toolpath builder ───────────────────────────────────────────────
+
+    def _align_toolpath_to_stock(
+        self,
+        toolpath: list,
+        bounds: tuple,
+    ) -> list:
+        """Translate a toolpath so cutting moves are centred over the stock.
+
+        G-code files often use machine coordinates that are completely different
+        from the stock's local coordinate system.  This method computes an XYZ
+        offset that:
+          • centres the XY footprint of cutting moves over the stock XY centre
+          • aligns the highest cutting-move Z with the stock top surface (z_max)
+
+        Supports both ToolPose segment lists and plain ndarray (start, end) pairs.
+        If the toolpath is already well inside the stock bounds (offset < 1 mm)
+        the original list is returned unchanged.
+        """
+        # Collect endpoint positions of cutting (non-rapid) moves.
+        # Segments can be (ToolPose, ToolPose) for swept-volume mode
+        # or (tuple|ndarray, tuple|ndarray) for standard canonical mode.
+        cut_positions = []
+        for seg_s, seg_e in toolpath:
+            if isinstance(seg_e, ToolPose):
+                if seg_e.motion_type != "G0":
+                    cut_positions.append(seg_e.position)
+            elif seg_e is not None:
+                cut_positions.append(np.asarray(seg_e, dtype=float))
+
+        if not cut_positions:
+            return toolpath
+
+        cut_pos = np.array(cut_positions)
+        gx_min, gx_max = float(cut_pos[:, 0].min()), float(cut_pos[:, 0].max())
+        gy_min, gy_max = float(cut_pos[:, 1].min()), float(cut_pos[:, 1].max())
+        gz_min, gz_max = float(cut_pos[:, 2].min()), float(cut_pos[:, 2].max())
+
+        sx_min, sx_max, sy_min, sy_max, sz_min, sz_max = bounds
+        sz_range = max(sz_max - sz_min, 1.0)
+
+        dx = (sx_min + sx_max) / 2.0 - (gx_min + gx_max) / 2.0
+        dy = (sy_min + sy_max) / 2.0 - (gy_min + gy_max) / 2.0
+        dz = sz_max - gz_max
+
+        # Guard: if dz is implausibly large (G1 safe-height moves inflated gz_max),
+        # try aligning gz_min to sz_min instead — this handles work-coordinate
+        # G-code where cuts go from slightly above zero down to negative Z.
+        if abs(dz) > sz_range * 10:
+            dz = sz_min - gz_min
+
+        if abs(dx) < 1.0 and abs(dy) < 1.0 and abs(dz) < 1.0:
+            return toolpath
+
+        print(
+            f"[Auto-align] G-code → stock offset:"
+            f" dx={dx:.2f}  dy={dy:.2f}  dz={dz:.2f}"
+        )
+        offset = np.array([dx, dy, dz], dtype=float)
+
+        def _shift_pose(pose: ToolPose) -> ToolPose:
+            return ToolPose(
+                pose.position + offset,
+                pose.rotation,
+                feed=pose.feed,
+                line_no=pose.line_no,
+                tool_id=pose.tool_id,
+                motion_type=pose.motion_type,
+                source_line=pose.source_line,
+                segment_index=pose.segment_index,
+                segment_count=pose.segment_count,
+                arc_center=pose.arc_center,
+                arc_radius=pose.arc_radius,
+                arc_direction=pose.arc_direction,
+            )
+
+        new_toolpath = []
+        for seg_s, seg_e in toolpath:
+            if isinstance(seg_s, ToolPose) and isinstance(seg_e, ToolPose):
+                new_toolpath.append((_shift_pose(seg_s), _shift_pose(seg_e)))
+            elif not isinstance(seg_s, ToolPose) and not isinstance(seg_e, ToolPose):
+                # plain tuple or ndarray positions (standard canonical mode)
+                s_arr = np.asarray(seg_s, dtype=float) + offset
+                e_arr = np.asarray(seg_e, dtype=float) + offset
+                new_toolpath.append((tuple(s_arr), tuple(e_arr)))
+            else:
+                new_toolpath.append((seg_s, seg_e))
+        return new_toolpath
 
     def _build_builtin_toolpath(self, strategy_idx: int, bounds: tuple) -> list:
         """Generate a built-in toolpath scaled to the given stock bounds."""
@@ -1323,6 +2067,24 @@ class MainWindow(QMainWindow):
             return make_spiral(
                 cx=cx, cy=cy, r0=r0, r1=r1, z_cut=z_cut,
             )
+
+    def _make_gcode_parser(self, path: str):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".mpf":
+            return SiemensSinumerikParser()
+        return GCodeParser()
+
+    def _load_canonical_gcode(self, path: str):
+        parser = self._make_gcode_parser(path)
+        return parser.parse_file_canonical(path)
+
+    @staticmethod
+    def _toolpath_from_canonical(program) -> list:
+        return [
+            (move.start, move.end)
+            for move in program.moves
+            if not move.rapid
+        ]
 
     # ── Button handlers ────────────────────────────────────────────────
 
@@ -1370,43 +2132,79 @@ class MainWindow(QMainWindow):
             r    = self.sp_radius.value()
             tool = BallEndMill(r) if self.cb_tool.currentIndex() == 0 \
                    else FlatEndMill(r)
-            self._engine = SimulationEngine(self._stock, tool)
+            use_swept = self.cb_sim_method.currentIndex() == 1
+            if use_swept:
+                self._engine = SweptVolumeSimulationEngine(
+                    self._stock,
+                    tool,
+                    radial_segments=8,
+                    axial_segments=3,
+                    use_envelope=False,
+                    subdivide_moves=False,
+                    legacy_z_topdown=True,
+                    detect_collision=self.chk_collision.isChecked(),
+                    collision_pose_samples=2,
+                    collision_n_u=8,
+                    collision_n_v=3,
+                )
+            else:
+                self._engine = SimulationEngine(self._stock, tool)
+            self._update_collision_status()
 
             # ── Build toolpath ────────────────────────────────────────
             if self.rb_gcode.isChecked():
                 if not self._gcode_file:
                     self._set_status("Please select a G-code file", WARNING)
                     return
-                parser = GCodeParser()
-                moves  = parser.parse_file(self._gcode_file)
-                self._gcode_moves = moves   # keep for _build_scene overlay
-                toolpath = []
-                prev = None
-                for m in moves:
-                    cur = (m.x, m.y, m.z)
-                    if prev is not None and not m.rapid:
-                        toolpath.append((prev, cur))
-                    prev = cur
+                program = self._load_canonical_gcode(self._gcode_file)
+                self._canonical_program = program
+                self._gcode_moves = gcode_moves_from_canonical_moves(program.moves)
+                if use_swept:
+                    # Include G0 rapid moves so the tool visually follows the
+                    # full path; SimWorker skips simulation for rapid segments.
+                    toolpath = all_pose_segments_from_gcode_moves(self._gcode_moves)
+                else:
+                    toolpath = self._toolpath_from_canonical(program)
                 if not toolpath:
                     self._set_status("No cutting moves found in G-code", WARNING)
                     return
+                # Auto-align: G-code may use machine coordinates; shift so
+                # cutting moves are centred on the stock and the highest cut
+                # aligns with the stock top surface.
+                toolpath = self._align_toolpath_to_stock(toolpath, bounds)
             else:
                 toolpath = self._build_builtin_toolpath(
                     self.cb_strategy.currentIndex(), bounds
                 )
 
             # ── Launch ────────────────────────────────────────────────
+            self._result_mesh = None
+            self.btn_export.setEnabled(False)
+            run_note = ""
+
             self._build_scene(bounds)
 
-            delay_ms = self._speed_delay_ms(self.sl_speed.value())
+            delay_ms, step_multiplier, frame_interval_ms, segment_batch = self._speed_settings(
+                self.sl_speed.value()
+            )
             self._worker = SimWorker(
-                self._engine, toolpath, emit_every=1, delay_ms=delay_ms
+                self._engine,
+                toolpath,
+                emit_every=1,
+                delay_ms=delay_ms,
+                step_multiplier=step_multiplier,
+                frame_interval_ms=frame_interval_ms,
+                segment_batch=segment_batch,
+                preview_i_idx=self._display_i_idx,
+                preview_j_idx=self._display_j_idx,
+                live_surface=not self.chk_final_only.isChecked(),
             )
             self._worker.progress.connect(self._on_progress)
             self._worker.frame_ready.connect(self._on_frame)
             self._worker.finished.connect(self._on_finished)
             self._pending_hmap = None
             self._pending_tool_pos = None
+            self._pending_frame_dirty = False
             self._render_timer.start()
             self._worker.start()
             launched = True   # simulation is now running; _on_mesh_ready re-enables Start
@@ -1414,7 +2212,9 @@ class MainWindow(QMainWindow):
             self.btn_stop.setEnabled(True)
             self.progress_bar.setValue(0)
             n = len(toolpath)
-            self._set_status(f"Simulating ({n} moves)", SUCCESS)
+            method = "Swept Volume" if use_swept else "Legacy Continuous"
+            self._set_status(f"Simulating {method} ({n} moves){run_note}", SUCCESS)
+            self._update_collision_status()
 
         except Exception as exc:
             QMessageBox.critical(self, "Simulation Error", str(exc))
@@ -1431,6 +2231,7 @@ class MainWindow(QMainWindow):
     def _stop(self):
         self._render_timer.stop()
         self._pending_hmap = None
+        self._pending_frame_dirty = False
         if self._worker:
             self._worker.stop()
         self.btn_stop.setEnabled(False)
@@ -1439,6 +2240,7 @@ class MainWindow(QMainWindow):
     def _reset(self):
         self._render_timer.stop()
         self._pending_hmap = None
+        self._pending_frame_dirty = False
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait()
@@ -1447,10 +2249,14 @@ class MainWindow(QMainWindow):
         self._surface       = None
         self._surface_actor = None
         self._tool_actor    = None
+        self._result_mesh   = None
         self.progress_bar.setValue(0)
         self.lbl_seg.setText("Idle")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self._engine = None
+        self._update_collision_status()
         self._set_status("Ready", ACCENT)
         if self.rb_file.isChecked() and self._stock_file:
             self._preview_stl(self._stock_file)

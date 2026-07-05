@@ -1,3 +1,37 @@
-from .tool_geometry import ToolGeometry, FlatEndMill, BallEndMill, BullNoseEndMill
+from .tool_geometry import (
+    COMPONENT_BALL,
+    COMPONENT_BOTTOM,
+    COMPONENT_CORNER,
+    COMPONENT_HOLDER,
+    COMPONENT_SHANK,
+    COMPONENT_SIDE,
+    TOOL_COMPONENTS,
+    BallEndMill,
+    BullNoseEndMill,
+    FlatEndMill,
+    TaperTool,
+    ToolComponent,
+    ToolHolder,
+    ToolGeometry,
+    ToolSurfaceSample,
+    component_for_id,
+)
 
-__all__ = ["ToolGeometry", "FlatEndMill", "BallEndMill", "BullNoseEndMill"]
+__all__ = [
+    "COMPONENT_BALL",
+    "COMPONENT_BOTTOM",
+    "COMPONENT_CORNER",
+    "COMPONENT_HOLDER",
+    "COMPONENT_SHANK",
+    "COMPONENT_SIDE",
+    "TOOL_COMPONENTS",
+    "ToolComponent",
+    "ToolGeometry",
+    "ToolSurfaceSample",
+    "component_for_id",
+    "FlatEndMill",
+    "BallEndMill",
+    "BullNoseEndMill",
+    "TaperTool",
+    "ToolHolder",
+]

@@ -57,6 +57,32 @@ class TriDexelStock:
         self.y_grid.initialize_stock(y_min, y_max)
 
     # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def contains_point(self, x: float, y: float, z: float) -> bool:
+        """Return True when all three dexel grids still contain this point."""
+        if not (
+            self.x_min <= x <= self.x_max
+            and self.y_min <= y <= self.y_max
+            and self.z_min <= z <= self.z_max
+        ):
+            return False
+
+        zi = self.z_grid.clamp_row(self.z_grid.row_index(x))
+        zj = self.z_grid.clamp_col(self.z_grid.col_index(y))
+        xi = self.x_grid.clamp_row(self.x_grid.row_index(y))
+        xj = self.x_grid.clamp_col(self.x_grid.col_index(z))
+        yi = self.y_grid.clamp_row(self.y_grid.row_index(x))
+        yj = self.y_grid.clamp_col(self.y_grid.col_index(z))
+
+        return (
+            self.z_grid.rays[zi][zj].contains(z)
+            and self.x_grid.rays[xi][xj].contains(x)
+            and self.y_grid.rays[yi][yj].contains(y)
+        )
+
+    # ------------------------------------------------------------------
     # Reconstruction
     # ------------------------------------------------------------------
 

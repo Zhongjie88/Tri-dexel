@@ -36,11 +36,28 @@ class ZDexelGrid:
         self.ny = n_col
         self.dx = (row_max - row_min) / n_row
         self.dy = (col_max - col_min) / n_col
-        self.rays: list[list[DexelRay]] = [
-            [DexelRay() for _ in range(n_col)] for _ in range(n_row)
-        ]
         # Cached top-surface heights; updated incrementally by subtract_at().
         self._height: np.ndarray = np.full((n_row, n_col), np.nan)
+        self._height_versions: np.ndarray = np.full((n_row, n_col), -1, dtype=int)
+        self.rays: list[list[DexelRay]] = []
+        for i in range(n_row):
+            row: list[DexelRay] = []
+            for j in range(n_col):
+                row.append(DexelRay(self._make_ray_change_handler(i, j)))
+            self.rays.append(row)
+
+    def _make_ray_change_handler(self, i: int, j: int):
+        def _on_change(ray: DexelRay) -> None:
+            self._refresh_height_at(i, j, ray)
+
+        return _on_change
+
+    def _refresh_height_at(self, i: int, j: int, ray: DexelRay | None = None) -> None:
+        if ray is None:
+            ray = self.rays[i][j]
+        top = ray.top()
+        self._height[i, j] = top if top is not None else np.nan
+        self._height_versions[i, j] = ray.version
 
     # ------------------------------------------------------------------
     # Initialization
@@ -51,7 +68,6 @@ class ZDexelGrid:
         for row in self.rays:
             for ray in row:
                 ray.set_solid(depth_lo, depth_hi)
-        self._height[:] = depth_hi
 
     # ------------------------------------------------------------------
     # Coordinate helpers
@@ -79,12 +95,10 @@ class ZDexelGrid:
     # Fast update path (used by the simulation engine)
     # ------------------------------------------------------------------
 
-    def subtract_at(self, i: int, j: int, cut_lo: float, cut_hi: float) -> None:
+    def subtract_at(self, i: int, j: int, cut_lo: float, cut_hi: float, metadata=None) -> None:
         """Subtract interval from ray (i,j) and update the height cache."""
         ray = self.rays[i][j]
-        ray.subtract(cut_lo, cut_hi)
-        top = ray.top()
-        self._height[i, j] = top if top is not None else np.nan
+        ray.subtract(cut_lo, cut_hi, metadata=metadata)
 
     def sync_height_cache(self) -> None:
         """Rebuild the height cache from current ray state (O(nx*ny) one-time cost).
@@ -93,8 +107,7 @@ class ZDexelGrid:
         """
         for i in range(self.nx):
             for j in range(self.ny):
-                top = self.rays[i][j].top()
-                self._height[i, j] = top if top is not None else np.nan
+                self._refresh_height_at(i, j)
 
     # ------------------------------------------------------------------
     # Queries
@@ -103,7 +116,7 @@ class ZDexelGrid:
     def height_map(self) -> np.ndarray:
         """Top-surface depth values for every ray; NaN where ray is empty.
 
-        Returns a copy of the internally cached array — O(nx*ny) copy only.
+        Returns a copy of the internally cached array.
         """
         return self._height.copy()
 

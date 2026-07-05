@@ -91,6 +91,19 @@ class TestEngine:
         j = stock.z_grid.col_index(25.0)
         assert hmap[i, j] == pytest.approx(20.0, abs=1.5)
 
+    def test_flat_mill_cuts_partially_covered_z_cells(self):
+        stock = TriDexelStock((0.0, 4.0, 0.0, 4.0, 0.0, 4.0), 1.0)
+        stock.initialize_box_stock()
+        tool = FlatEndMill(0.2)
+        eng = SimulationEngine(stock, tool)
+
+        eng.apply_tool_at(1.1, 1.5, 2.0)
+
+        hmap = stock.z_grid.height_map()
+        left_cell_center_distance = math.dist((0.5, 1.5), (1.1, 1.5))
+        assert left_cell_center_distance > tool.radius
+        assert hmap[0, 1] == pytest.approx(2.0)
+
     def test_ball_mill_creates_curved_pocket(self):
         stock = make_stock()
         tool = BallEndMill(4.0)
@@ -114,6 +127,49 @@ class TestEngine:
         for xi in [12.0, 20.0, 30.0, 38.0]:
             i = stock.z_grid.row_index(xi)
             assert hmap[i, j] == pytest.approx(20.0, abs=1.5), f"xi={xi}"
+
+    def test_simulate_toolpath_matches_segmented_path_for_connected_lines(self):
+        toolpath = [
+            ((10.0, 25.0, 20.0), (15.0, 25.0, 20.0)),
+            ((15.0, 25.0, 20.0), (20.0, 25.0, 20.0)),
+            ((20.0, 25.0, 20.0), (25.0, 25.0, 20.0)),
+            ((25.0, 25.0, 20.0), (30.0, 25.0, 20.0)),
+        ]
+        stock_segmented = make_stock()
+        stock_continuous = make_stock()
+        tool = FlatEndMill(3.0)
+        segmented = SimulationEngine(stock_segmented, tool)
+        continuous = SimulationEngine(stock_continuous, tool)
+
+        for start, end in toolpath:
+            segmented.simulate_move(start, end, step=1.0)
+        continuous.simulate_toolpath(toolpath, step=1.0)
+
+        assert stock_continuous.z_grid.height_map() == pytest.approx(
+            stock_segmented.z_grid.height_map(),
+            abs=1e-9,
+        )
+
+    def test_simulate_toolpath_samples_sharp_direction_change_junction(self):
+        stock = make_stock()
+        tool = FlatEndMill(3.0)
+        eng = SimulationEngine(stock, tool)
+        calls = []
+        original_apply = eng.apply_tool_at
+
+        def record_apply(x, y, z):
+            calls.append((round(x, 3), round(y, 3), round(z, 3)))
+            original_apply(x, y, z)
+
+        eng.apply_tool_at = record_apply
+        toolpath = [
+            ((10.0, 10.0, 20.0), (10.4, 10.0, 20.0)),
+            ((10.4, 10.0, 20.0), (10.4, 10.4, 20.0)),
+        ]
+
+        eng.simulate_toolpath(toolpath, step=1.0)
+
+        assert (10.4, 10.0, 20.0) in calls
 
     def test_rapid_move_does_not_cut(self):
         from src.gcode.parser import GCodeMove
@@ -155,3 +211,22 @@ def test_gcode_parser_linearizes_ij_arcs():
     assert all(not move.rapid for move in moves[1:])
     assert moves[-1].x == pytest.approx(0.0)
     assert moves[-1].y == pytest.approx(1.0)
+
+
+def test_gcode_parser_preserves_arc_source_metadata():
+    from src.gcode.parser import GCodeParser
+
+    moves = GCodeParser(arc_segment_length=0.5).parse(
+        "G90 G0 X1 Y0 Z0\n"
+        "G2 X0 Y-1 I-1 J0 F100\n"
+        "X-1 Y0 I0 J1\n"
+    )
+    arc_moves = [move for move in moves if move.motion_type == "G2"]
+
+    assert len(arc_moves) > 2
+    assert all(move.arc_center is not None for move in arc_moves)
+    assert all(move.arc_direction == "CW" for move in arc_moves)
+    assert {move.line_no for move in arc_moves} == {2, 3}
+    assert arc_moves[0].segment_index == 1
+    assert arc_moves[0].segment_count is not None
+    assert arc_moves[-1].source_line == "X-1 Y0 I0 J1"

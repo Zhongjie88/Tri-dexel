@@ -70,10 +70,14 @@ def voxel_to_mesh(
         spacing=(resolution, resolution, resolution),
     )
 
-    # Offset verts: undo the 1-cell padding, then add world-space origin
-    verts[:, 0] += x_min - resolution
-    verts[:, 1] += y_min - resolution
-    verts[:, 2] += z_min - resolution
+    # Voxels are cell-centered samples. After adding one false padding cell,
+    # the material boundary between padded index 0 (outside) and 1 (first
+    # material cell) is emitted by marching cubes at coordinate 0.5. Therefore
+    # the world offset must place that coordinate at the stock minimum.
+    half = 0.5 * resolution
+    verts[:, 0] += x_min - half
+    verts[:, 1] += y_min - half
+    verts[:, 2] += z_min - half
 
     faces_pv = np.column_stack([np.full(len(faces), 3, dtype=np.int64), faces]).ravel()
     mesh = pv.PolyData(verts, faces_pv)
