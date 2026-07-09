@@ -26,7 +26,13 @@ def _orthonormalize(rotation: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True)
 class ToolPose:
-    """Rigid tool pose: local tool coordinates to world coordinates."""
+    """Rigid tool pose: local tool coordinates to world coordinates.
+
+    Project convention:
+    - ``position`` is the programmed tool tip point.
+    - local +Z is the tool axis from the tip toward the shank/holder.
+    - ``axis`` returns that local +Z direction in world coordinates.
+    """
 
     position: np.ndarray
     rotation: np.ndarray

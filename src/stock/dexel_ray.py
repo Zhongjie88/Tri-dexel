@@ -1,4 +1,5 @@
 from __future__ import annotations
+import bisect
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from .surface_metadata import SurfaceMetadata, make_surface_metadata
@@ -30,6 +31,7 @@ class DexelRay:
     def set_solid(self, lo: float, hi: float) -> None:
         """Initialize ray as a single solid block from lo to hi."""
         self.intervals = [(lo, hi)]
+        self.surface_metadata.clear()
         self._mark_changed()
 
     def is_empty(self) -> bool:
@@ -44,32 +46,33 @@ class DexelRay:
         """Remove material in range [cut_lo, cut_hi]. No-op if range is degenerate."""
         if cut_lo >= cut_hi:
             return
-        if metadata is not None:
-            self.surface_metadata.append(make_surface_metadata((cut_lo, cut_hi), metadata))
         result: List[Interval] = []
+        changed = False
         for lo, hi in self.intervals:
             if hi <= cut_lo or lo >= cut_hi:
                 result.append((lo, hi))
                 continue
+            # This interval overlaps the cut — material is removed.
+            changed = True
             if lo < cut_lo:
                 result.append((lo, cut_lo))
             if hi > cut_hi:
                 result.append((cut_hi, hi))
-        if result != self.intervals:
+        if changed:
             self.intervals = result
+            if metadata is not None:
+                self.surface_metadata.append(make_surface_metadata((cut_lo, cut_hi), metadata))
             self._mark_changed()
 
     def union(self, add_lo: float, add_hi: float) -> None:
         """Add material in [add_lo, add_hi], merging overlapping intervals."""
         if add_lo >= add_hi:
             return
-        self.intervals.append((add_lo, add_hi))
-        self.intervals.sort(key=lambda iv: iv[0])
-        merged: List[Interval] = []
-        for lo, hi in self.intervals:
-            if merged and lo <= merged[-1][1]:
-                prev_lo, prev_hi = merged[-1]
-                merged[-1] = (prev_lo, max(prev_hi, hi))
+        bisect.insort(self.intervals, (add_lo, add_hi))
+        merged: List[Interval] = [self.intervals[0]]
+        for lo, hi in self.intervals[1:]:
+            if lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
             else:
                 merged.append((lo, hi))
         if merged != self.intervals:
@@ -85,7 +88,12 @@ class DexelRay:
         return self.intervals[0][0] if self.intervals else None
 
     def contains(self, value: float) -> bool:
-        return any(lo <= value <= hi for lo, hi in self.intervals)
+        for lo, hi in self.intervals:
+            if lo > value:
+                return False  # intervals are sorted; nothing later can match
+            if value <= hi:
+                return True
+        return False
 
     def __repr__(self) -> str:
         return f"DexelRay({self.intervals})"

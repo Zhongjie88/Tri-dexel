@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .z_dexel_grid import ZDexelGrid
+from .numpy_grid import NumpyDexelGrid, NumpyZDexelGrid
 
 
 class TriDexelStock:
@@ -38,12 +38,12 @@ class TriDexelStock:
         self.y_min, self.y_max = y_min, y_max
         self.z_min, self.z_max = z_min, z_max
 
-        # Z-direction: rays // Z, indexed by (i=X, j=Y)
-        self.z_grid = ZDexelGrid(x_min, x_max, y_min, y_max, nx, ny)
-        # X-direction: rays // X, indexed by (j=Y, k=Z)
-        self.x_grid = ZDexelGrid(y_min, y_max, z_min, z_max, ny, nz)
-        # Y-direction: rays // Y, indexed by (i=X, k=Z)
-        self.y_grid = ZDexelGrid(x_min, x_max, z_min, z_max, nx, nz)
+        # Z-direction: rays // Z, indexed by (i=X, j=Y) — needs height cache for display
+        self.z_grid = NumpyZDexelGrid(x_min, x_max, y_min, y_max, nx, ny)
+        # X/Y grids only need interval data for voxel reconstruction; their
+        # height_map() is never queried, so skip the per-subtract callback chain.
+        self.x_grid = NumpyDexelGrid(y_min, y_max, z_min, z_max, ny, nz)
+        self.y_grid = NumpyDexelGrid(x_min, x_max, z_min, z_max, nx, nz)
 
     # ------------------------------------------------------------------
     # Initialization
@@ -101,4 +101,6 @@ class TriDexelStock:
         vox_y = self.y_grid.to_dense_voxel(y_min, y_max, ny)          # [nx, nz, ny]
         vox_y = np.transpose(vox_y, (0, 2, 1))                         # [nx, ny, nz]
 
-        return vox_z & vox_x & vox_y
+        vox_z &= vox_x
+        vox_z &= vox_y
+        return vox_z

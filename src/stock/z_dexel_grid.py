@@ -27,6 +27,7 @@ class ZDexelGrid:
         col_max: float,
         n_row: int,
         n_col: int,
+        track_height: bool = True,
     ) -> None:
         self.row_min = row_min
         self.row_max = row_max
@@ -36,14 +37,18 @@ class ZDexelGrid:
         self.ny = n_col
         self.dx = (row_max - row_min) / n_row
         self.dy = (col_max - col_min) / n_col
+        self.row_centers = row_min + (np.arange(n_row, dtype=float) + 0.5) * self.dx
+        self.col_centers = col_min + (np.arange(n_col, dtype=float) + 0.5) * self.dy
         # Cached top-surface heights; updated incrementally by subtract_at().
+        # Only needed for grids whose height_map() is actually queried (z_grid).
+        self._track_height = track_height
         self._height: np.ndarray = np.full((n_row, n_col), np.nan)
-        self._height_versions: np.ndarray = np.full((n_row, n_col), -1, dtype=int)
         self.rays: list[list[DexelRay]] = []
         for i in range(n_row):
             row: list[DexelRay] = []
             for j in range(n_col):
-                row.append(DexelRay(self._make_ray_change_handler(i, j)))
+                cb = self._make_ray_change_handler(i, j) if track_height else None
+                row.append(DexelRay(cb))
             self.rays.append(row)
 
     def _make_ray_change_handler(self, i: int, j: int):
@@ -57,7 +62,6 @@ class ZDexelGrid:
             ray = self.rays[i][j]
         top = ray.top()
         self._height[i, j] = top if top is not None else np.nan
-        self._height_versions[i, j] = ray.version
 
     # ------------------------------------------------------------------
     # Initialization
@@ -74,10 +78,10 @@ class ZDexelGrid:
     # ------------------------------------------------------------------
 
     def row_center(self, i: int) -> float:
-        return self.row_min + (i + 0.5) * self.dx
+        return float(self.row_centers[i])
 
     def col_center(self, j: int) -> float:
-        return self.col_min + (j + 0.5) * self.dy
+        return float(self.col_centers[j])
 
     def row_index(self, v: float) -> int:
         return int((v - self.row_min) / self.dx)

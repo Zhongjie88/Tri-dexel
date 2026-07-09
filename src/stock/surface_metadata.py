@@ -17,6 +17,8 @@ class SurfaceMetadata(Mapping[str, Any]):
     component_id: int | None = None
     component_name: str | None = None
     surface_role: str | None = None
+    component_role: str | None = None
+    removed_by: str | None = None
     tool_id: str | None = None
     line_no: int | None = None
     operation_id: str | None = None
@@ -27,6 +29,9 @@ class SurfaceMetadata(Mapping[str, Any]):
     arc_center: tuple[float, float] | None = None
     arc_radius: float | None = None
     arc_direction: str | None = None
+    collision_warning: bool = False
+    collision_component: str | None = None
+    collision_reason: str | None = None
     gouging_risk: bool = False
     sharp_edge: bool = False
 
@@ -39,6 +44,8 @@ class SurfaceMetadata(Mapping[str, Any]):
             "component_id": self.component_id,
             "component_name": self.component_name,
             "surface_role": self.surface_role,
+            "component_role": self.component_role,
+            "removed_by": self.removed_by,
             "tool_id": self.tool_id,
             "line_no": self.line_no,
             "operation_id": self.operation_id,
@@ -49,8 +56,12 @@ class SurfaceMetadata(Mapping[str, Any]):
             "arc_center": self.arc_center,
             "arc_radius": self.arc_radius,
             "arc_direction": self.arc_direction,
+            "collision_component": self.collision_component,
+            "collision_reason": self.collision_reason,
         }
         out.update({key: value for key, value in fields.items() if value is not None})
+        if self.collision_warning:
+            out["collision_warning"] = True
         if self.gouging_risk:
             out["gouging_risk"] = True
         if self.sharp_edge:
@@ -86,13 +97,18 @@ def make_surface_metadata(
     component_id = values.pop("component_id", None)
     component_name = values.pop("component_name", None)
     surface_role = values.pop("surface_role", None)
-    if component_id is not None and (component_name is None or surface_role is None):
+    component_role = values.pop("component_role", None)
+    if component_id is not None and (
+        component_name is None or surface_role is None or component_role is None
+    ):
         try:
             component = component_for_id(component_id)
             if component_name is None:
                 component_name = component.name
             if surface_role is None:
                 surface_role = component.surface_role
+            if component_role is None:
+                component_role = component.role.value
         except ValueError:
             pass
     return SurfaceMetadata(
@@ -103,6 +119,8 @@ def make_surface_metadata(
         component_id=component_id,
         component_name=component_name,
         surface_role=surface_role,
+        component_role=component_role,
+        removed_by=values.pop("removed_by", None),
         tool_id=values.pop("tool_id", None),
         line_no=values.pop("line_no", None),
         operation_id=values.pop("operation_id", None),
@@ -113,6 +131,9 @@ def make_surface_metadata(
         arc_center=values.pop("arc_center", None),
         arc_radius=values.pop("arc_radius", None),
         arc_direction=values.pop("arc_direction", None),
+        collision_warning=bool(values.pop("collision_warning", False)),
+        collision_component=values.pop("collision_component", None),
+        collision_reason=values.pop("collision_reason", None),
         gouging_risk=bool(values.pop("gouging_risk", False)),
         sharp_edge=bool(values.pop("sharp_edge", False)),
     )

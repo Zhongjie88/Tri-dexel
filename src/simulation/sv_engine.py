@@ -129,6 +129,11 @@ class SweptVolumeSimulationEngine:
             total_hits += len(hits)
             for hit in hits:
                 component_name, surface_role = component_labels(hit.component_id)
+                component_role = None
+                if hit.component_id is not None:
+                    from ..tool.tool_geometry import component_for_id
+
+                    component_role = component_for_id(hit.component_id).role.value
                 grid.subtract_at(
                     hit.i,
                     hit.j,
@@ -142,6 +147,8 @@ class SweptVolumeSimulationEngine:
                         component_id=hit.component_id,
                         component_name=component_name,
                         surface_role=surface_role,
+                        component_role=component_role,
+                        removed_by="cutting_zone",
                         tool_id=end.tool_id or start.tool_id,
                         line_no=end.line_no or start.line_no,
                         motion_type=end.motion_type or start.motion_type,
@@ -226,6 +233,13 @@ class SweptVolumeSimulationEngine:
         dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
         if step is None:
             step = self.stock.resolution
+        # When not subdividing the swept-volume move we can afford a coarser Z
+        # step: adjacent tool footprints (radius R) still overlap as long as the
+        # step is <= 2R, so using R/2 is conservative and 2-6× faster than
+        # sampling at every resolution unit.
+        if not self.subdivide_moves:
+            tool_r = float(getattr(self.tool, "_radius", step))
+            step = max(step, tool_r * 0.5)
         n = max(1, math.ceil(dist / step))
         for k in range(n + 1):
             t = k / n

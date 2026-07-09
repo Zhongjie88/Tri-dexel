@@ -19,6 +19,8 @@ class CollisionEvent:
     component_id: int | None
     component_name: str | None
     surface_role: str | None
+    component_role: str | None = None
+    reason: str = "non_cutting_component_intersects_stock"
     line_no: int | None = None
     motion_type: str | None = None
     source_line: str | None = None
@@ -69,12 +71,19 @@ def detect_pose_collision(
 
         cid = int(component_id) if np.isfinite(component_id) else None
         component_name, surface_role = component_labels(cid)
+        component_role = None
+        if cid is not None:
+            from ..tool.tool_geometry import component_for_id
+
+            component_role = component_for_id(cid).role.value
         events.append(
             CollisionEvent(
                 position=(x, y, z),
                 component_id=cid,
                 component_name=component_name,
                 surface_role=surface_role,
+                component_role=component_role,
+                reason="non_cutting_component_intersects_stock",
                 line_no=pose.line_no,
                 motion_type=pose.motion_type,
                 source_line=pose.source_line,

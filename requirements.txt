@@ -2,6 +2,10 @@ numpy>=1.24
 pyvista>=0.43
 pyvistaqt>=0.11
 PyQt6>=6.5
-gmsh>=4.11
 scikit-image>=0.21
-pytest>=7.4
+
+# Optional: STEP/STP import via gmsh
+# gmsh>=4.11
+
+# Optional: run tests
+# pytest>=7.4

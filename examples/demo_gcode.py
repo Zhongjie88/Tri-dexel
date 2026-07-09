@@ -61,7 +61,12 @@ def main():
     engine = SimulationEngine(stock, tool)
     print("Simulating …")
     t0 = time.perf_counter()
-    engine.simulate_gcode(moves, progress=True)
+    n = len(moves)
+    def _print_progress(cur, total):
+        if cur % max(1, total // 20) == 0 or cur == total:
+            print(f"\r  simulating {cur*100//total:3d}%  [{cur}/{total}]", end="", flush=True)
+    engine.simulate_gcode(moves, progress_callback=_print_progress)
+    print()
     print(f"Done in {time.perf_counter() - t0:.1f} s")
 
     hmap = stock.z_grid.height_map()

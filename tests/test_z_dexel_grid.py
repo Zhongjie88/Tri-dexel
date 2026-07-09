@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from src.stock.numpy_grid import NumpyZDexelGrid
 from src.stock.z_dexel_grid import ZDexelGrid
 
 
@@ -67,3 +68,13 @@ def test_coordinate_helpers():
     assert g.col_center(0) == pytest.approx(5.0)
     assert g.row_index(55.0) == 5
     assert g.col_index(105.0) == 10
+
+
+def test_numpy_rays_proxy_iteration_is_bounded():
+    g = NumpyZDexelGrid(0.0, 3.0, 0.0, 2.0, 3, 2)
+    g.initialize_stock(0.0, 10.0)
+
+    rows = list(g.rays)
+    assert len(rows) == 3
+    assert [len(list(row)) for row in rows] == [2, 2, 2]
+    assert sum(1 for row in g.rays for _ray in row) == 6

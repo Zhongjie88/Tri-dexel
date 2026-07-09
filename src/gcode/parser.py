@@ -71,6 +71,7 @@ class GCodeParser:
         self._modal_motion = 0  # 0=G0, 1=G1, 2=G2, 3=G3
         self._absolute = True
         self._plane = "G17"
+        self._unit_scale = 1.0  # 1.0=mm (G21), 25.4=inch (G20)
         self.warnings: list[str] = []
 
     def _strip_comments(self, line: str) -> str:
@@ -150,6 +151,10 @@ class GCodeParser:
                 self._modal_motion = g
             elif g in (17, 18, 19):
                 self._plane = f"G{g}"
+            elif g == 20:
+                self._unit_scale = 25.4   # inch mode
+            elif g == 21:
+                self._unit_scale = 1.0    # mm mode
             elif g == 90:
                 self._absolute = True
             elif g == 91:
@@ -160,17 +165,18 @@ class GCodeParser:
         if not has_motion:
             return []
 
+        scale = self._unit_scale
         if self._absolute:
-            new_x = words.get("X", self._x)
-            new_y = words.get("Y", self._y)
-            new_z = words.get("Z", self._z)
-            new_a = words.get("A", self._a)
+            new_x = words["X"] * scale if "X" in words else self._x
+            new_y = words["Y"] * scale if "Y" in words else self._y
+            new_z = words["Z"] * scale if "Z" in words else self._z
+            new_a = words.get("A", self._a)   # rotary axes always in degrees
             new_b = words.get("B", self._b)
             new_c = words.get("C", self._c)
         else:
-            new_x = self._x + words.get("X", 0.0)
-            new_y = self._y + words.get("Y", 0.0)
-            new_z = self._z + words.get("Z", 0.0)
+            new_x = self._x + words.get("X", 0.0) * scale
+            new_y = self._y + words.get("Y", 0.0) * scale
+            new_z = self._z + words.get("Z", 0.0) * scale
             new_a = self._add_optional_axis(self._a, words.get("A"))
             new_b = self._add_optional_axis(self._b, words.get("B"))
             new_c = self._add_optional_axis(self._c, words.get("C"))
@@ -337,11 +343,11 @@ class GCodeParser:
             ]
         sx, sy, sz = self._x, self._y, self._z
         if "I" in words or "J" in words:
-            cx = sx + words.get("I", 0.0)
-            cy = sy + words.get("J", 0.0)
+            cx = sx + words.get("I", 0.0) * self._unit_scale
+            cy = sy + words.get("J", 0.0) * self._unit_scale
             r = math.hypot(sx - cx, sy - cy)
         elif "R" in words:
-            center = self._arc_center_from_radius(sx, sy, end_x, end_y, words["R"])
+            center = self._arc_center_from_radius(sx, sy, end_x, end_y, words["R"] * self._unit_scale)
             if center is None:
                 warning = (
                     f"line {line_no}: {motion_type} R arc cannot be resolved and "

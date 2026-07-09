@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "tri-dexel"
+version = "0.1.0"
+description = "Tri-dexel NC machining simulator"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "PyQt6",
+    "pyvista",
+    "pyvistaqt",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+fast = ["numba"]
+step = ["gmsh"]
+dev  = ["pytest", "black", "isort", "ruff"]
+all  = ["tri-dexel[fast,step,dev]"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

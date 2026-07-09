@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,14 @@ COMPONENT_SHANK = 4
 COMPONENT_HOLDER = 5
 
 
+class ToolComponentRole(Enum):
+    """Engineering role of a tool component in machining simulation."""
+
+    CUTTING = "cutting"
+    COLLISION_ONLY = "collision_only"
+    VISUAL_ONLY = "visual_only"
+
+
 @dataclass(frozen=True)
 class ToolComponent:
     """Semantic role of a sampled tool surface component."""
@@ -24,6 +33,7 @@ class ToolComponent:
     surface_role: str
     cutting: bool
     collision: bool
+    role: ToolComponentRole = ToolComponentRole.CUTTING
 
 
 TOOL_COMPONENTS = {
@@ -33,6 +43,7 @@ TOOL_COMPONENTS = {
         surface_role="bottom",
         cutting=True,
         collision=True,
+        role=ToolComponentRole.CUTTING,
     ),
     COMPONENT_SIDE: ToolComponent(
         COMPONENT_SIDE,
@@ -40,6 +51,7 @@ TOOL_COMPONENTS = {
         surface_role="side",
         cutting=True,
         collision=True,
+        role=ToolComponentRole.CUTTING,
     ),
     COMPONENT_BALL: ToolComponent(
         COMPONENT_BALL,
@@ -47,6 +59,7 @@ TOOL_COMPONENTS = {
         surface_role="ball",
         cutting=True,
         collision=True,
+        role=ToolComponentRole.CUTTING,
     ),
     COMPONENT_CORNER: ToolComponent(
         COMPONENT_CORNER,
@@ -54,6 +67,7 @@ TOOL_COMPONENTS = {
         surface_role="corner",
         cutting=True,
         collision=True,
+        role=ToolComponentRole.CUTTING,
     ),
     COMPONENT_SHANK: ToolComponent(
         COMPONENT_SHANK,
@@ -61,6 +75,7 @@ TOOL_COMPONENTS = {
         surface_role="shank",
         cutting=False,
         collision=True,
+        role=ToolComponentRole.COLLISION_ONLY,
     ),
     COMPONENT_HOLDER: ToolComponent(
         COMPONENT_HOLDER,
@@ -68,6 +83,7 @@ TOOL_COMPONENTS = {
         surface_role="holder",
         cutting=False,
         collision=True,
+        role=ToolComponentRole.COLLISION_ONLY,
     ),
 }
 
@@ -145,6 +161,30 @@ class ToolGeometry(ABC):
     @abstractmethod
     def radius(self) -> float:
         """Maximum radial extent of the cutting envelope."""
+
+    @property
+    def cutting_length(self) -> float:
+        """Effective axial cutting length measured from the tool tip along +Z."""
+        return math.inf
+
+    @property
+    def overall_length(self) -> float:
+        """Overall modelled tool length measured from the tool tip along +Z."""
+        return self.cutting_length
+
+    def cutting_z_range(self, tip_z: float) -> tuple[float, float]:
+        """World Z range of cutting geometry for a vertical tool pose."""
+        return float(tip_z), float(tip_z) + float(self.cutting_length)
+
+    def cutting_top_z(self, tip_z: float) -> float:
+        """Highest world Z reached by cutting geometry for a vertical pose."""
+        return self.cutting_z_range(tip_z)[1]
+
+    def get_cutting_components(self) -> tuple[ToolComponent, ...]:
+        return tuple(component for component in TOOL_COMPONENTS.values() if component.cutting)
+
+    def get_collision_components(self) -> tuple[ToolComponent, ...]:
+        return tuple(component for component in TOOL_COMPONENTS.values() if component.collision)
 
     @abstractmethod
     def z_cut(self, d: float, tip_z: float) -> Optional[float]:
@@ -302,17 +342,48 @@ class FlatEndMill(ToolGeometry):
       - Cylindrical shank above
     """
 
-    def __init__(self, radius: float, height: float | None = None) -> None:
+    def __init__(
+        self,
+        radius: float,
+        height: float | None = None,
+        cutting_length: float | None = None,
+        overall_length: float | None = None,
+        shank_diameter: float | None = None,
+    ) -> None:
         self._radius = _positive_float(radius, "radius")
-        self._height = (
-            _positive_float(height, "height")
-            if height is not None
-            else 2.0 * self._radius
-        )
+        if cutting_length is None and height is None:
+            # Backward compatibility: older callers only supplied a radius and
+            # expected the vertical analytical cutter to remove material up to
+            # the current stock top.  Keep that behaviour until a flute length
+            # is explicitly supplied.
+            self._cutting_length = math.inf
+            self._height = 2.0 * self._radius
+        else:
+            if cutting_length is None:
+                cutting_length = height
+            self._cutting_length = _positive_float(cutting_length, "cutting_length")
+            self._height = self._cutting_length  # backward-compatible alias
+        if overall_length is None:
+            overall_length = self._height
+        self._overall_length = _positive_float(overall_length, "overall_length")
+        if math.isfinite(self._cutting_length) and self._overall_length < self._cutting_length:
+            raise ValueError("overall_length must be >= cutting_length")
+        if shank_diameter is None:
+            self._shank_radius = self._radius
+        else:
+            self._shank_radius = 0.5 * _positive_float(shank_diameter, "shank_diameter")
 
     @property
     def radius(self) -> float:
         return self._radius
+
+    @property
+    def cutting_length(self) -> float:
+        return self._cutting_length
+
+    @property
+    def overall_length(self) -> float:
+        return self._overall_length
 
     def z_cut(self, d: float, tip_z: float) -> Optional[float]:
         if d > self._radius:
@@ -320,7 +391,7 @@ class FlatEndMill(ToolGeometry):
         return tip_z
 
     def cross_section_radius(self, zk: float, tip_z: float) -> Optional[float]:
-        if zk < tip_z:
+        if zk < tip_z or zk > tip_z + self._cutting_length:
             return None
         return self._radius
 
@@ -330,7 +401,7 @@ class FlatEndMill(ToolGeometry):
         return out
 
     def cross_section_radius_arr(self, zk_arr: np.ndarray, tip_z: float) -> tuple:
-        valid = zk_arr >= tip_z
+        valid = (zk_arr >= tip_z) & (zk_arr <= tip_z + self._cutting_length)
         rz    = np.where(valid, self._radius, 0.0)
         return valid, rz
 
@@ -346,6 +417,8 @@ class FlatEndMill(ToolGeometry):
             radial_segments = legacy_kwargs.get("radial_segments", n_u)
             axial_segments = legacy_kwargs.get("axial_segments", n_v)
             height = legacy_kwargs.get("height", self._height)
+            if not include_non_cutting:
+                height = min(float(height), self._height)
             return self._legacy_ring_surface(radial_segments, axial_segments, height)
 
         n_u = max(3, int(n_u))
@@ -374,6 +447,17 @@ class FlatEndMill(ToolGeometry):
                 normals.append((ca, sa, 0.0))
                 component_ids.append(COMPONENT_SIDE)
                 parameters.append((a, z))
+
+        if include_shank and self._overall_length > self._height:
+            z_values = np.linspace(self._height, self._overall_length, n_v + 1)
+            for z in z_values:
+                for a in angles:
+                    ca = math.cos(a)
+                    sa = math.sin(a)
+                    points.append((self._shank_radius * ca, self._shank_radius * sa, z))
+                    normals.append((ca, sa, 0.0))
+                    component_ids.append(COMPONENT_SHANK)
+                    parameters.append((a, z))
 
         return self._validate_surface(
             np.asarray(points),
@@ -421,17 +505,54 @@ class BallEndMill(ToolGeometry):
       - Cylindrical shank above equator (z > tip_z + r)
     """
 
-    def __init__(self, radius: float, height: float | None = None) -> None:
+    def __init__(
+        self,
+        radius: float,
+        height: float | None = None,
+        cutting_length: float | None = None,
+        overall_length: float | None = None,
+        shank_diameter: float | None = None,
+    ) -> None:
         self._radius = _positive_float(radius, "radius")
         self._height = (
             _positive_float(height, "height")
             if height is not None
             else 2.0 * self._radius
         )
+        if cutting_length is None:
+            # Backward compatibility for legacy analytic side-grid cutting:
+            # old BallEndMill(radius) behaved as if the cylindrical section
+            # above the ball could cut indefinitely.  Explicit cutting_length
+            # enables machining-aware flute limits.
+            self._cutting_length = math.inf
+            self._surface_cutting_length = self._radius
+        else:
+            self._cutting_length = max(
+                self._radius,
+                _positive_float(cutting_length, "cutting_length"),
+            )
+            self._surface_cutting_length = self._cutting_length
+        if overall_length is None:
+            overall_length = self._radius + self._height
+        self._overall_length = _positive_float(overall_length, "overall_length")
+        if math.isfinite(self._cutting_length) and self._overall_length < self._cutting_length:
+            raise ValueError("overall_length must be >= cutting_length")
+        if shank_diameter is None:
+            self._shank_radius = self._radius
+        else:
+            self._shank_radius = 0.5 * _positive_float(shank_diameter, "shank_diameter")
 
     @property
     def radius(self) -> float:
         return self._radius
+
+    @property
+    def cutting_length(self) -> float:
+        return self._cutting_length
+
+    @property
+    def overall_length(self) -> float:
+        return self._overall_length
 
     def z_cut(self, d: float, tip_z: float) -> Optional[float]:
         r = self._radius
@@ -448,8 +569,10 @@ class BallEndMill(ToolGeometry):
             # Ball zone: cross-section radius shrinks toward tip
             val = r * r - (zk - tip_z - r) ** 2
             return math.sqrt(max(0.0, val))
-        # Shank zone: full radius
-        return r
+        if zk <= tip_z + self._cutting_length:
+            # Optional side flute above the ball equator.
+            return r
+        return None
 
     def z_cut_arr(self, d_arr: np.ndarray, tip_z: float) -> np.ndarray:
         r = self._radius
@@ -462,13 +585,13 @@ class BallEndMill(ToolGeometry):
     def cross_section_radius_arr(self, zk_arr: np.ndarray, tip_z: float) -> tuple:
         r = self._radius
         ball_zone  = (zk_arr >= tip_z) & (zk_arr <= tip_z + r)
-        shank_zone = zk_arr > tip_z + r
-        valid = ball_zone | shank_zone
+        side_zone = (zk_arr > tip_z + r) & (zk_arr <= tip_z + self._cutting_length)
+        valid = ball_zone | side_zone
         rz = np.zeros(len(zk_arr), dtype=float)
         if np.any(ball_zone):
             dz = zk_arr[ball_zone] - (tip_z + r)
             rz[ball_zone] = np.sqrt(np.maximum(0.0, r*r - dz*dz))
-        rz[shank_zone] = r
+        rz[side_zone] = r
         return valid, rz
 
     def sample_surface(
@@ -482,9 +605,9 @@ class BallEndMill(ToolGeometry):
         if "radial_segments" in legacy_kwargs or "axial_segments" in legacy_kwargs:
             radial_segments = legacy_kwargs.get("radial_segments", n_u)
             axial_segments = legacy_kwargs.get("axial_segments", n_v)
-            height = legacy_kwargs.get("height", self._radius + self._height)
+            height = legacy_kwargs.get("height", self._overall_length)
             if not include_non_cutting:
-                height = self._radius
+                height = self._surface_cutting_length
             return self._legacy_ring_surface(radial_segments, axial_segments, height)
 
         n_u = max(3, int(n_u))
@@ -509,13 +632,24 @@ class BallEndMill(ToolGeometry):
                 component_ids.append(COMPONENT_BALL)
                 parameters.append((phi, theta))
 
-        if include_shank:
-            z_values = np.linspace(self._radius, self._radius + self._height, n_v + 1)
+        if self._surface_cutting_length > self._radius:
+            z_values = np.linspace(self._radius, self._surface_cutting_length, n_v + 1)
             for z in z_values:
                 for phi in angles:
                     ca = math.cos(phi)
                     sa = math.sin(phi)
                     points.append((self._radius * ca, self._radius * sa, z))
+                    normals.append((ca, sa, 0.0))
+                    component_ids.append(COMPONENT_SIDE)
+                    parameters.append((phi, z))
+
+        if include_shank and self._overall_length > self._surface_cutting_length:
+            z_values = np.linspace(self._surface_cutting_length, self._overall_length, n_v + 1)
+            for z in z_values:
+                for phi in angles:
+                    ca = math.cos(phi)
+                    sa = math.sin(phi)
+                    points.append((self._shank_radius * ca, self._shank_radius * sa, z))
                     normals.append((ca, sa, 0.0))
                     component_ids.append(COMPONENT_SHANK)
                     parameters.append((phi, z))
@@ -559,6 +693,11 @@ class BallEndMill(ToolGeometry):
                     n_norm = np.linalg.norm(n)
                     normals[i, j] = n / n_norm if n_norm > 1e-12 else (0.0, 0.0, -1.0)
                 else:
+                    component_ids[i, j] = (
+                        COMPONENT_SIDE
+                        if z <= self._cutting_length
+                        else COMPONENT_SHANK
+                    )
                     normals[i, j] = (ca, sa, 0.0)
         return {"points": points, "normals": normals, "component_ids": component_ids}
 
@@ -601,6 +740,14 @@ class BullNoseEndMill(ToolGeometry):
     def radius(self) -> float:
         return self._radius
 
+    @property
+    def cutting_length(self) -> float:
+        return self._cr + self._height
+
+    @property
+    def overall_length(self) -> float:
+        return self._cr + self._height + self._shank_height
+
     def z_cut(self, d: float, tip_z: float) -> Optional[float]:
         r, cr, fr = self._radius, self._cr, self._flat_r
         if d > r:
@@ -614,6 +761,8 @@ class BullNoseEndMill(ToolGeometry):
     def cross_section_radius(self, zk: float, tip_z: float) -> Optional[float]:
         r, cr, fr = self._radius, self._cr, self._flat_r
         if zk < tip_z:
+            return None
+        if zk > tip_z + self.cutting_length:
             return None
         if zk <= tip_z + cr:
             # Corner fillet zone: outer boundary shrinks
@@ -722,6 +871,14 @@ class TaperTool(ToolGeometry):
     def radius(self) -> float:
         return max(self._bottom_radius, self._top_radius)
 
+    @property
+    def cutting_length(self) -> float:
+        return self._height
+
+    @property
+    def overall_length(self) -> float:
+        return self._height + self._shank_height
+
     def _radius_at_local_z(self, z: float) -> float:
         t = min(1.0, max(0.0, z / self._height))
         return self._bottom_radius + (self._top_radius - self._bottom_radius) * t
@@ -744,7 +901,7 @@ class TaperTool(ToolGeometry):
         local_z = zk - tip_z
         if local_z <= self._height:
             return self._radius_at_local_z(local_z)
-        return self._top_radius
+        return None
 
     def sample_surface(
         self,
@@ -834,6 +991,17 @@ class ToolHolder(ToolGeometry):
     @property
     def radius(self) -> float:
         return self._radius
+
+    @property
+    def cutting_length(self) -> float:
+        return 0.0
+
+    @property
+    def overall_length(self) -> float:
+        return self._z_offset + self._height
+
+    def cutting_z_range(self, tip_z: float) -> tuple[float, float]:
+        return float(tip_z), float(tip_z)
 
     def z_cut(self, d: float, tip_z: float) -> Optional[float]:
         return None
