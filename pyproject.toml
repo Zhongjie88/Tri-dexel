@@ -10,8 +10,10 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "PyQt6",
+    "qtpy",
     "pyvista",
     "pyvistaqt",
+    "vtk",
     "scikit-image",
 ]
 

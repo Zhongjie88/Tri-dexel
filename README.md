@@ -13,10 +13,20 @@ A Python-based CNC machining simulation system using the **tri-dexel** material 
 
 ## Requirements
 
-- Python 3.10+
-- See `pyproject.toml` for full dependency list
+- Anaconda or Miniconda on Windows
+- The project setup creates a `tridexel-occ` conda environment with Python 3.10
+- OpenCascade / `pythonocc-core` is installed from conda-forge by `setup.bat`
+- Python runtime packages are installed from `requirements.txt`
 
 ## Quick Start
+
+First-time setup:
+
+```bat
+setup.bat
+```
+
+Then launch the application:
 
 ```bat
 run.bat
@@ -25,9 +35,9 @@ run.bat
 Or manually:
 
 ```bash
-pip install numpy PyQt6 pyvista pyvistaqt scikit-image
-# Optional but recommended (JIT acceleration):
-pip install numba
+conda create -n tridexel-occ -c conda-forge python=3.10 pip pythonocc-core
+conda activate tridexel-occ
+pip install -r requirements.txt
 python app.py
 ```
 

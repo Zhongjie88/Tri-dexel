@@ -577,6 +577,7 @@ class MainWindow(QMainWindow):
         self._mesh_worker: MeshWorker | None    = None
         self._surface: pv.StructuredGrid | None = None
         self._surface_actor                     = None
+        self._feature_edge_actor                = None
         self._tool_actor                        = None
         self._result_mesh: pv.PolyData | None   = None
         self._display_mesh: pv.PolyData | None  = None
@@ -3744,6 +3745,69 @@ class MainWindow(QMainWindow):
             self.log(f"Display decimation skipped: {exc}")
             return mesh
 
+    def _mesh_with_normals(
+        self,
+        mesh: "pv.PolyData",
+        *,
+        split_vertices: bool,
+        point_normals: bool = True,
+        cell_normals: bool = True,
+    ) -> "pv.PolyData":
+        """Return a cleaned triangle mesh with stable normals for shading/export."""
+        prepared = mesh.triangulate().clean()
+        try:
+            prepared = prepared.compute_normals(
+                point_normals=point_normals,
+                cell_normals=cell_normals,
+                split_vertices=split_vertices,
+                consistent_normals=True,
+                auto_orient_normals=True,
+                feature_angle=38.0,
+                inplace=False,
+            )
+        except Exception as exc:
+            self.log(f"Normal rebuild skipped: {exc}")
+        return prepared
+
+    def _remove_feature_edges(self) -> None:
+        if self._feature_edge_actor is not None:
+            try:
+                self.plotter.remove_actor(self._feature_edge_actor)
+            except Exception:
+                pass
+            self._feature_edge_actor = None
+
+    def _add_feature_edge_overlay(self, mesh: "pv.PolyData") -> None:
+        """Overlay only visual feature edges, not every triangle edge."""
+        self._remove_feature_edges()
+        try:
+            edges = mesh.extract_feature_edges(
+                boundary_edges=True,
+                non_manifold_edges=True,
+                feature_edges=True,
+                manifold_edges=False,
+                feature_angle=42.0,
+            ).clean()
+        except Exception as exc:
+            self.log(f"Feature edge overlay skipped: {exc}")
+            return
+
+        if edges.n_cells <= 0:
+            return
+        max_edge_cells = 80_000
+        if edges.n_cells > max_edge_cells:
+            self.log(f"Feature edge overlay skipped: {edges.n_cells:,} line cells")
+            return
+
+        self._feature_edge_actor = self.plotter.add_mesh(
+            edges,
+            color="#172033",
+            line_width=1.0,
+            opacity=0.42,
+            render_lines_as_tubes=False,
+            pickable=False,
+        )
+
     def _finish_mesh_ready_ui(self) -> None:
         self.lbl_seg.setText("Idle")
         self.btn_start.setEnabled(True)
@@ -3781,6 +3845,7 @@ class MainWindow(QMainWindow):
         if self._surface_actor is not None:
             self.plotter.remove_actor(self._surface_actor)
             self._surface_actor = None
+        self._remove_feature_edges()
         if self._tool_actor is not None:
             self.plotter.remove_actor(self._tool_actor)
             self._tool_actor = None
@@ -3828,21 +3893,14 @@ class MainWindow(QMainWindow):
         if self._surface_actor is not None:
             self.plotter.remove_actor(self._surface_actor)
             self._surface_actor = None
+        self._remove_feature_edges()
         if self._tool_actor is not None:
             self.plotter.remove_actor(self._tool_actor)
             self._tool_actor = None
 
         z_max = self._stock.z_max
         z_min = self._stock.z_min
-        try:
-            display_mesh = display_mesh.compute_normals(
-                point_normals=True,
-                cell_normals=False,
-                split_vertices=False,
-                inplace=False,
-            )
-        except Exception:
-            pass
+        display_mesh = self._mesh_with_normals(display_mesh, split_vertices=True)
         cut_depth = np.maximum(0.0, z_max - display_mesh.points[:, 2])
         display_mesh["cut_depth"] = cut_depth
         self._display_mesh = display_mesh
@@ -3866,10 +3924,12 @@ class MainWindow(QMainWindow):
             },
             smooth_shading=True,
             show_edges=False,
-            ambient=0.32,
-            diffuse=0.80,
-            specular=0.22,
+            ambient=0.24,
+            diffuse=0.88,
+            specular=0.34,
+            specular_power=18,
         )
+        self._add_feature_edge_overlay(display_mesh)
         quality_name = self._display_quality_label(quality)
         self._set_data_state(
             display=f"Ready: {quality_name} ({int(display_mesh.n_cells):,} cells)"
@@ -3976,7 +4036,12 @@ class MainWindow(QMainWindow):
                 ext = ".stl"
 
         try:
-            mesh = self._result_mesh.triangulate().clean()
+            mesh = self._mesh_with_normals(
+                self._result_mesh,
+                split_vertices=True,
+                point_normals=True,
+                cell_normals=True,
+            )
             if "STL + STEP" in selected_filter:
                 base, chosen_ext = os.path.splitext(path)
                 if chosen_ext.lower() in (".stl", ".step", ".stp"):

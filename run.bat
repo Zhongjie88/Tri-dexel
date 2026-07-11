@@ -1,66 +1,48 @@
 @echo off
-setlocal
-title Tri-dexel Simulation
+setlocal EnableExtensions
+title Tri-dexel NC Machining Simulator
 
 set "ENV_NAME=tridexel-occ"
 set "PROJECT_DIR=%~dp0"
-set "CONDA_BAT=%USERPROFILE%\anaconda3\condabin\conda.bat"
 
-if not exist "%CONDA_BAT%" (
-    echo Conda launcher not found:
-    echo   %CONDA_BAT%
+call :find_conda
+if errorlevel 1 (
+    echo ERROR: Conda was not found.
     echo.
-    echo Open Anaconda Prompt and run:
-    echo   conda activate %ENV_NAME%
-    echo   cd /d "%PROJECT_DIR%"
-    echo   python app.py
+    echo Run setup.bat after installing Anaconda or Miniconda.
+    echo.
     pause
     exit /b 1
 )
 
-call "%CONDA_BAT%" activate %ENV_NAME%
+call "%CONDA_BAT%" env list | findstr /B /C:"%ENV_NAME% " >nul 2>&1
 if errorlevel 1 (
-    echo Failed to activate conda environment: %ENV_NAME%
+    echo ERROR: Conda environment was not found: %ENV_NAME%
     echo.
-    echo Create it first with:
-    echo   conda create -n %ENV_NAME% -c conda-forge python=3.10 pythonocc-core numpy scipy scikit-image pyvista pyvistaqt vtk pyqt gmsh pytest
+    echo Double-click setup.bat first. It will create the environment and install dependencies.
+    echo.
     pause
     exit /b 1
 )
 
-python -c "from PyQt6.QtWidgets import QApplication; import pyvista; import pyvistaqt; import qtpy; import vtk" >nul 2>&1
+call "%CONDA_BAT%" activate "%ENV_NAME%"
 if errorlevel 1 (
-    echo GUI dependencies are missing in environment: %ENV_NAME%
-    echo Installing PyQt6 / PyVista dependencies ...
-    python -m pip install PyQt6==6.7.1 PyQt6-Qt6==6.7.1 PyQt6-sip pyvista pyvistaqt qtpy vtk --disable-pip-version-check
-    if errorlevel 1 (
-        echo.
-        echo Failed to install GUI dependencies.
-        pause
-        exit /b 1
-    )
-)
-
-python -c "import numpy; import skimage; import gmsh" >nul 2>&1
-if errorlevel 1 (
-    echo Simulation dependencies are missing in environment: %ENV_NAME%
-    echo Installing numerical / meshing dependencies ...
-    python -m pip install numpy scikit-image gmsh --disable-pip-version-check
-    if errorlevel 1 (
-        echo.
-        echo Failed to install simulation dependencies.
-        pause
-        exit /b 1
-    )
-)
-
-python -c "from OCC.Core.STEPControl import STEPControl_Writer; print('OpenCascade OK')" >nul 2>&1
-if errorlevel 1 (
-    echo OpenCascade is not available in environment: %ENV_NAME%
+    echo ERROR: Failed to activate conda environment: %ENV_NAME%
     echo.
-    echo Run:
-    echo   conda activate %ENV_NAME%
-    echo   conda install -c conda-forge pythonocc-core
+    echo Double-click setup.bat to repair the environment.
+    echo.
+    pause
+    exit /b 1
+)
+
+set "QT_API=pyqt6"
+
+python -c "import os; os.environ.setdefault('QT_API', 'pyqt6'); import numpy, pyvista, pyvistaqt, qtpy, vtk, gmsh, numba; from PyQt6.QtWidgets import QApplication; from skimage.measure import marching_cubes; from OCC.Core.STEPControl import STEPControl_Writer" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Some dependencies are missing in environment: %ENV_NAME%
+    echo.
+    echo Double-click setup.bat to install or repair the environment.
+    echo.
     pause
     exit /b 1
 )
@@ -75,3 +57,23 @@ if errorlevel 1 (
     echo ERROR: app.py crashed. See message above.
     pause
 )
+exit /b 0
+
+:find_conda
+set "CONDA_BAT="
+
+if exist "%USERPROFILE%\anaconda3\condabin\conda.bat" set "CONDA_BAT=%USERPROFILE%\anaconda3\condabin\conda.bat"
+if not defined CONDA_BAT if exist "%USERPROFILE%\miniconda3\condabin\conda.bat" set "CONDA_BAT=%USERPROFILE%\miniconda3\condabin\conda.bat"
+if not defined CONDA_BAT if exist "%LOCALAPPDATA%\anaconda3\condabin\conda.bat" set "CONDA_BAT=%LOCALAPPDATA%\anaconda3\condabin\conda.bat"
+if not defined CONDA_BAT if exist "%LOCALAPPDATA%\miniconda3\condabin\conda.bat" set "CONDA_BAT=%LOCALAPPDATA%\miniconda3\condabin\conda.bat"
+if not defined CONDA_BAT if exist "%ProgramData%\anaconda3\condabin\conda.bat" set "CONDA_BAT=%ProgramData%\anaconda3\condabin\conda.bat"
+if not defined CONDA_BAT if exist "%ProgramData%\miniconda3\condabin\conda.bat" set "CONDA_BAT=%ProgramData%\miniconda3\condabin\conda.bat"
+
+if not defined CONDA_BAT (
+    for /f "delims=" %%I in ('conda info --base 2^>nul') do (
+        if exist "%%I\condabin\conda.bat" set "CONDA_BAT=%%I\condabin\conda.bat"
+    )
+)
+
+if not defined CONDA_BAT exit /b 1
+exit /b 0
